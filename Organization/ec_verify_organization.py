@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ECCC File Organization Verification Script
+EC File Organization Verification Script
 Samples moved files and verifies they're in the correct province folders
 by cross-referencing with the station CSV files.
 """

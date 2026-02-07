@@ -1,6 +1,6 @@
 # EC Historical Weather Remarks Extraction Pipeline
 
-A Python pipeline for extracting qualitative weather remarks from Environment Canada's (EC) historical weather observation forms using Vision Language Models (VLMs).
+A Python pipeline for extracting qualitative weather remarks from Environment Canada's (EC) pre-1940 historical weather observation forms using Vision Language Models (VLMs) running on rented cloud GPUs.
 
 ## Project Overview
 
@@ -11,338 +11,142 @@ Extract handwritten qualitative remarks from pre-1940 weather observation forms,
 - Extreme weather events (storms, floods, fires, droughts)
 - General weather descriptions that reveal how Canadians understood and communicated about weather and nature
 
+### Dataset
+
+The source dataset consists of approximately 1 million digitized scans (PNG/TIF) of monthly weather observation forms from Canadian (and some US) weather stations spanning the 1870s through the 1960s. Of these, 571,712 pre-1940 files are the target for processing.
+
 ### Approach
 
-The pipeline uses a Vision Language Model (VLM) to perform handwritten text recognition (HTR) on full-page scans, followed by post-processing filters to isolate qualitative remarks from quantitative data and form boilerplate.
+The pipeline uses full-page VLM inference to extract qualitative remarks directly from scans. The VLM handles both the vision task (reading handwritten text) and the logic task (identifying which text constitutes qualitative remarks worth extracting). Inference runs on rented GPU hardware via [vast.ai](https://vast.ai), with images sent individually from a local machine to the remote server. This avoids uploading the full 6 TB dataset to the cloud and respects data handling requirements, as no permanent copy of the scans is stored remotely.
+
+Earlier approaches that were explored and ultimately abandoned include region-of-interest cropping (too many form variants), extract-everything-then-filter post-processing (unnecessary with sufficiently powerful models), and local-only inference (hardware constraints made it infeasible at scale).
 
 ---
 
-## System Requirements
+## Project Structure
 
-### Hardware
-
-**My Configuration:**
-- GPU: NVIDIA RTX 4080 (12GB VRAM)
-- RAM: 32GB
-- CPU: AMD Ryzen 9 7945HX
-- Storage: 6TB+ for full dataset
-
-**Recommended for production:**
-- GPU: 24GB+ VRAM (RTX 4090, A100, etc.)
-- RAM: 32GB+
-- Fast SSD storage for scan files
-
-### Software
-
-- Python 3.13
-- CUDA 11.8+ (for GPU acceleration)
-- Ollama (for local VLM inference)
-
-### Python Dependencies
-
-```bash
-pip install pandas openpyxl Pillow requests
 ```
-
-For VLM backends (install as needed):
-```bash
-# Ollama backend (recommended)
-# Install Ollama separately: https://ollama.ai
-
-# Optional: vLLM backend
-pip install vllm
-
-# Optional: Transformers backend  
-pip install transformers torch accelerate qwen-vl-utils
+EC-HTR/
+├── README.md                          # This file
+│
+├── Organization/                      # Stage 1: File organization tools
+│   ├── ec_organizer_enhanced.py       # Sorts scans by province/territory and year
+│   ├── ec_verify_organization.py      # Verifies correct file placement
+│   ├── EC-Inventory-2014.csv          # Station inventory (18,707 stations)
+│   ├── EC-Inventory-2022.csv          # Station inventory (8,781 stations)
+│   ├── organization_stats.csv         # Organization results
+│   ├── file_organization.log          # Processing log
+│   └── verification_results.json      # Verification results
+│
+└── Benchmark/                         # Stage 2: VLM benchmarking package
+    ├── benchmark.py                   # Main VLM benchmarking script (runs on vast.ai)
+    ├── ground_truth.csv               # Human-verified extractions for 150 test images
+    ├── EC-Inventory-2022.csv          # Station inventory for lookups
+    ├── EC-Inventory-2014.csv          # Station inventory for lookups
+    ├── README.md                      # Step-by-step vast.ai setup guide
+    └── test_images/                   # 150 stratified sample images for benchmarking
 ```
 
 ---
 
-## Pipeline Architecture
+## Stage 1: Organization
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        EC HTR EXTRACTION PIPELINE                           │
-└─────────────────────────────────────────────────────────────────────────────┘
+The organization stage sorts the raw dataset of ~1 million scans into a structured directory hierarchy by province/territory, using each file's Climate ID to determine its geographic origin.
 
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Scan Files │────▶│ vlm_processor    │────▶│  results.jsonl  │
-│  (PNG/TIF)  │     │       .py        │     │  (raw VLM text) │
-└─────────────┘     └──────────────────┘     └────────┬────────┘
-                            │                         │
-                            ▼                         ▼
-                    ┌──────────────────┐     ┌─────────────────┐
-                    │ vlm_backends.py  │     │ postprocess_    │
-                    │ (Ollama/vLLM/    │     │ remarks.py      │
-                    │  Transformers)   │     └────────┬────────┘
-                    └──────────────────┘              │
-                                                      ▼
-┌─────────────────┐                         ┌─────────────────┐
-│ Station CSVs    │                         │ extracted_      │
-│ (2014 & 2022    │                         │ remarks.xlsx    │
-│  inventories)   │                         │ (final output)  │
-└─────────────────┘                         └─────────────────┘
-```
+### How It Works
 
-### Components
+Each scan filename follows the convention `9904_CLIMATEID_YYYY_MM[_A].png`, where the 7-digit Climate ID encodes the province (first digit), climatological district (digits 2-3), and station (digits 4-7). The organizer cross-references each Climate ID against two EC station inventory CSVs (2014 and 2022) to resolve the province/territory, then moves the file into the corresponding directory. Files dated after 1939 are separated into an "irrelevant" directory since they fall outside the project's scope.
 
-| File | Purpose |
-|------|---------|
-| `vlm_processor.py` | Main processing script - parses filenames, looks up stations, calls VLM |
-| `vlm_backends.py` | VLM abstraction layer - supports Ollama, vLLM, Transformers backends |
-| `postprocess_remarks.py` | Filters raw VLM output to extract qualitative remarks |
-| `test_vlm_processor.py` | Validation utilities for testing and debugging |
+Non-standard Climate IDs (e.g., `610ML02`, `706CFQ3`) are looked up directly in the inventory CSVs. Any files that cannot be resolved are flagged for manual review.
 
----
+### Results
 
-## Data Format
-
-### Input: Scan Filenames
-
-Scans follow the naming convention:
-```
-9904_CLIMATEID_YYYY_MM[_A].png
-```
-
-| Component | Description | Example |
-|-----------|-------------|---------|
-| `9904` | Form code (historical monthly observation form) | `9904` |
-| `CLIMATEID` | 7-digit station identifier | `1010774` |
-| `YYYY` | Year | `1932` |
-| `MM` | Month (01-12) | `11` |
-| `_A` | Optional suffix for backside of form | `_A` |
-
-**Example:** `9904_1010774_1932_11_A.png` = November 1932, Station 1010774, backside
-
-### Climate ID Structure
-
-The Climate ID is a 7-digit number assigned by the Meteorological Service of Canada:
-- **Digit 1:** Province code
-- **Digits 2-3:** Climatological district within province
-- **Digits 4-7:** Unique station identifier
-
-### Station Inventory CSVs
-
-Two CSV files provide station metadata:
-
-**2014 Inventory** (`EC_Historical_Weather_Station_inventory_2014_01.csv`):
-- 18,707 stations
-- Contains: Climate ID, Station Name, Province, Coordinates, Date ranges
-
-**2022 Inventory** (`EC_Historical_Weather_Station_inventory_2022.csv`):
-- 8,781 stations
-- Contains: Similar fields with some variations
-
-The processor merges both sources, preferring 2022 data when available.
-
----
-
-## Installation
-
-### 1. Install Ollama
-
-```bash
-# Linux
-curl -fsSL https://ollama.ai/install.sh | sh
-
-# Start the service
-sudo systemctl start ollama
-
-# Pull the model
-ollama pull qwen2.5-vl:7b
-```
-
-### 2. Clone/Download Scripts
-
-Place all Python scripts in your working directory:
-```
-project/
-├── vlm_processor.py
-├── vlm_backends.py
-├── postprocess_remarks.py
-├── test_ec_processor.py
-├── EC_Historical_Weather_Station_inventory_2014_01.csv
-├── EC_Historical_Weather_Station_inventory_2022.csv
-└── scans/           # Your scan files
-    ├── 9904_1010774_1932_11.png
-    └── ...
-```
-
-### 3. Install Python Dependencies
-
-```bash
-pip install pandas openpyxl Pillow requests
-```
-
----
-
-## Usage
-
-### Stage 1: VLM Text Extraction
-
-Extract all handwritten text from scans:
-
-```bash
-python ec_vlm_processor.py \
-    --input-dir ./scans \
-    --output ./results.jsonl \
-    --csv-2014 ./EC_Historical_Weather_Station_inventory_2014_01.csv \
-    --csv-2022 ./EC_Historical_Weather_Station_inventory_2022.csv \
-    --model qwen3-vl:8b-instruct \
-    --backend ollama
-```
-
-**Key Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--input-dir` | Required | Directory containing scan files |
-| `--output` | `results.jsonl` | Output file for VLM results |
-| `--csv-2014` | Required | Path to 2014 station inventory |
-| `--csv-2022` | Required | Path to 2022 station inventory |
-| `--model` | `qwen3-vl:8b-instruct` | VLM model name |
-| `--backend` | `ollama` | VLM backend (ollama/vllm/transformers) |
-| `--batch-size` | `10` | Files per checkpoint |
-| `--skip-backside` | `True` | Skip files ending in `_A` |
-| `--cutoff-year` | `1940` | Skip files after this year |
-
-**Checkpointing:**
-
-The processor automatically saves progress every `--batch-size` files. If interrupted, simply re-run the same command to resume from where it stopped.
-
-### Stage 2: Post-Processing
-
-Filter raw VLM output to extract qualitative remarks:
-
-```bash
-python postprocess_remarks.py \
-    ./results.jsonl \
-    --output ./extracted_remarks.xlsx
-```
-
-**Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `input` | Required | Input JSONL file from Stage 1 |
-| `--output` | `extracted_remarks.xlsx` | Output Excel file |
-| `--verbose` | False | Print sample extractions |
-
----
-
-## Output Format
-
-### Stage 1 Output: `results.jsonl`
-
-JSON Lines format with one record per file:
-
-```json
-{
-  "filepath": "/path/to/9904_1010774_1932_11.png",
-  "filename": "9904_1010774_1932_11.png",
-  "climate_id": "1010774",
-  "station_name": "VICTORIA INTL A",
-  "province": "BC",
-  "location": "British Columbia",
-  "year": 1932,
-  "month": 11,
-  "extracted_text": "Rain all day; Heavy frost overnight; First snow of season",
-  "processing_time": 4.23,
-  "status": "success",
-  "timestamp": "2025-11-25T14:30:00"
-}
-```
-
-### Stage 2 Output: `extracted_remarks.xlsx`
-
-Excel workbook with three sheets:
-
-**Sheet 1: Extracted Remarks**
-| Filename | Year | Month | Station | Location | Remarks |
-|----------|------|-------|---------|----------|---------|
-| 9904_1010774_1932_11.png | 1932 | 11 | VICTORIA INTL A | British Columbia | Rain all day; Heavy frost overnight |
-
-**Sheet 2: Summary**
-| Metric | Value |
+| Metric | Count |
 |--------|-------|
-| Total files processed | 100 |
-| Files with qualitative remarks | 74 |
-| Files without remarks | 26 |
-| Total individual remarks extracted | 677 |
-| Extraction rate | 74.0% |
+| Total files found | 996,602 |
+| Files organized | 988,852 |
+| Pre-1940 files (target set) | 571,712 |
+| Post-1939 files (excluded) | 424,890 |
+| Non-standard IDs resolved | 3,536 |
+| Files needing manual QC | 0 |
+| Errors | 0 |
 
-**Sheet 3: All Files**
+**Pre-1940 files by province/territory:**
 
-Complete list of all processed files with metadata and status.
+| Province / Territory | Files |
+|----------------------|-------|
+| Ontario | 165,391 |
+| British Columbia | 124,577 |
+| Alberta | 66,435 |
+| Saskatchewan | 59,467 |
+| Quebec | 48,651 |
+| Manitoba | 38,139 |
+| Nova Scotia | 25,631 |
+| New Brunswick | 16,292 |
+| Newfoundland & Labrador | 12,140 |
+| Northwest Territories | 5,713 |
+| Prince Edward Island | 3,649 |
+| Nunavut | 2,838 |
+| Yukon | 2,789 |
 
----
+### Usage
 
-## Post-Processing Filters
+```bash
+python Organization/ec_organizer_enhanced.py \
+    --input-dir /path/to/raw/scans \
+    --output-dir /path/to/organized \
+    --csv-2014 Organization/EC-Inventory-2014.csv \
+    --csv-2022 Organization/EC-Inventory-2022.csv
 
-The post-processor removes the following categories of text:
-
-### Filtered Out
-
-| Category | Examples |
-|----------|----------|
-| **Form boilerplate** | "Station:", "Province:", "Observer:", "For the month of" |
-| **Column headers** | "Remarks", "Wind", "Temperature", "Precipitation" |
-| **Quantitative data** | Numbers, measurements, coordinates |
-| **Time entries** | "8:00 a.m.", "Noon to Midnight" |
-| **Statistical terms** | "Means", "Sums", "Total", "Diff. from Normal" |
-| **Month/day labels** | "January", "Mon.", "Day 1:" |
-| **Generic weather terms** | "Fine", "Fair", "Good", "Mild" (in isolation) |
-| **VLM artifacts** | Repeated text, gibberish patterns |
-
-### Preserved
-
-| Category | Examples |
-|----------|----------|
-| **Phenological observations** | "First robin of spring", "Ice break-up", "Commenced haying" |
-| **Extreme weather** | "Blizzard", "Gale", "Forest fire", "Thunderstorm" |
-| **Descriptive remarks** | "Very wet miserable", "Fog & gusty gale", "Heavy frost" |
-| **Compound observations** | "Clear & cold", "Cloudy - Snowfall", "Rain all day" |
-
----
-
-## Performance Considerations
-
-### Processing Speed
-
-| Model | Hardware | Speed | Notes |
-|-------|----------|-------|-------|
-| qwen2.5-vl:7b | RTX 4080 12GB | 5-15 sec/file | Recommended for testing |
-| qwen2.5-vl:3b | RTX 4080 12GB | 2-5 sec/file | Faster but less accurate |
-| qwen3-vl:8b | 24GB+ VRAM | 3-8 sec/file | Best accuracy |
-
-### Memory Management
-
-- Images are processed one at a time to minimize VRAM usage
-- Checkpointing prevents loss of progress
-- Consider splitting large directories into batches
+python Organization/ec_verify_organization.py \
+    --organized-dir /path/to/organized \
+    --csv-2014 Organization/EC-Inventory-2014.csv \
+    --csv-2022 Organization/EC-Inventory-2022.csv
+```
 
 ---
 
-## Known Limitations
+## Stage 2: Benchmarking
 
-### VLM Accuracy Issues
+The benchmarking stage evaluates VLM configurations to determine the best model, resolution, and GPU combination for processing the full dataset. This stage runs on rented GPU hardware from vast.ai.
 
-1. **Character substitution:** "Blindy" instead of "Windy", "Sheet" instead of "Sleet"
-2. **Repetition loops:** VLM sometimes outputs the same word hundreds of times
-3. **Difficult cursive:** Some handwriting from the 1880s-1900s is very challenging
-4. **Ink bleed-through:** Text from the back of pages sometimes appears
+### Why Cloud GPUs
 
-### Filter Limitations
+Local hardware (RTX 4080, 12 GB VRAM) proved insufficient for this task. The largest model that could run locally was Qwen3-VL-8B at 4-bit quantization, which produced inadequate accuracy and still could not meet the 5 second/file target needed to process the full dataset within a reasonable timeframe. Smaller models (Qwen2.5-VL-3B) improved speed but further degraded quality. Specialized vision encoder-decoders (Florence-2-Large) performed even worse. After exhausting local options, GPU rental was approved for both benchmarking and the eventual production run.
 
-1. **Over-filtering:** Some legitimate remarks may be removed if they match boilerplate patterns
-2. **Under-filtering:** Some form structure still passes through filters
-3. **Language:** Filters tuned for English and French; other languages may need additions
+### Models Tested
+
+Three models from the Qwen3-VL family were selected, all running at FP16 precision on the vLLM inference framework. Earlier testing eliminated Qwen2.5-VL, DeepSeek-VL2, and Florence-2-Large due to inferior performance or excessive suggestibility.
+
+| Model | Parameters | GPU | Hourly Cost (USD) |
+|-------|-----------|-----|--------------------|
+| Qwen3-VL-4B-Instruct | 4B | NVIDIA RTX A6000 (48 GB) | $0.60 |
+| Qwen3-VL-8B-Instruct | 8B | NVIDIA RTX A6000 (48 GB) | $0.60 |
+| Qwen3-VL-32B-Instruct | 32B | NVIDIA H200 SXM (141 GB) | $2.50 |
+
+Each model was tested at four maximum pixel budgets (16M, 8M, 4M, 2M megapixels) for a total of 12 configurations. The test dataset consists of 150 stratified random samples with manually verified ground truth.
+
+### Usage
+
+See `Benchmark/README.md` for step-by-step instructions on renting a GPU from vast.ai and running benchmarks. In brief:
+
+```bash
+# On the rented VM
+python benchmark.py \
+    --model 9 \
+    --image-dir ./test_images \
+    --ground-truth ./ground_truth.csv \
+    --inventory-2022 ./EC-Inventory-2022.csv \
+    --inventory-2014 ./EC-Inventory-2014.csv \
+```
 
 ---
 
-## Future Improvements
+## Known Challenges
 
-1. **Model upgrade:** Test with larger VLMs when hardware allows
-2. **Confidence scoring:** Add uncertainty estimates to extractions
-3. **Active learning:** Flag low-confidence extractions for human review
-4. **Batch processing:** Implement parallel processing for cloud deployment
+- **Character substitution:** VLMs may misread handwriting (e.g., "Sleet" as "Sheet", "Windy" as "Blindy")
+- **Pre-1900 handwriting:** Faded ink and archaic cursive styles are the most consistent source of false negatives across all models
+- **French-language forms:** All models tested currently struggle with French content; the 48,651 Quebec files may have lower accuracy
+- **Form variation:** Remarks don't appear in consistent locations across decades of form changes, and observers sometimes ignored form structure entirely
+- **Ink bleed-through:** Text from the reverse side of pages sometimes appears on scans
+- **False positives from adjacent columns:** Full-page extraction occasionally reads content from neighboring form columns (e.g., "General State of Weather"); post-processing filters can catch most of these
