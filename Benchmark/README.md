@@ -1,177 +1,149 @@
-# EC Weather Remarks - VLM Benchmark Package
+# EC Weather Remarks — VLM Benchmark (v9)
 
-This package benchmarks Vision Language Models for extracting qualitative weather remarks from historical ECCC weather observation forms.
+Benchmarks vision-language models for extracting qualitative remarks from historical ECCC weather forms,
+against the 150-file ground truth (66 with remarks, 84 without). Everything runs on one rented H200.
 
-## Quick Start
+v9 replaces the February (v8) harness, whose scoring, resolution handling, sampling and timing were faulty.
+See the v8 audit for details. The extraction prompt is unchanged from February, so the models are compared on the same prompt.
 
-1. **Prepare benchmark package locally**
-2. **Rent a GPU on vast.ai**
-3. **Upload files and run benchmarks**
-4. **Download results and generate report**
+## Test matrix
 
----
+| `--model` | Hugging Face ID | Rungs (MiP) | Notes |
+|---|---|---|---|
+| `qwen3vl-8b` | Qwen/Qwen3-VL-8B-Instruct | 2, 4, 8, 16 | |
+| `qwen3vl-32b` | Qwen/Qwen3-VL-32B-Instruct | 2, 4, 8, 16 | February's recommended model |
+| `qwen3.8-27b` | Qwen/Qwen3.8-27B | 2, 4, 8, 16 | Thinking disabled (`enable_thinking: False`) |
+| `chandra2` | datalab-to/chandra-ocr-2 | 6 | Recall probe only (see below) |
 
-## Step 1: Prepare Benchmark Package (Local)
+One invocation loads one model once and runs all of its rungs. Rungs are pixel budgets (2 MiP = 2,097,152 px).
+Images are scaled down to fit the budget, never up, so a scan smaller than the budget is sent at native size. The actual size sent is logged per file.
 
-Create a directory with all required files:
+**Chandra 2** is trained only on fixed full-page OCR prompts, so it can't take our extraction prompt.
+It runs in its own `ocr` mode at its default budget (~6 MiP) and reports **word recall only**: how much of the
+ground-truth remark text appears, in order, in its full-page transcript. That is a ceiling on its reading ability. Compare it
+with the Qwen models' word recall to decide whether an OCR-then-filter pipeline would be worth building. Its cost figures cover the
+OCR pass only; a filter pass would add to them.
+
+## Package layout
 
 ```
 ec_benchmark/
-├── benchmark.py           # Main benchmark script
-├── ground_truth.csv      # Your verified ground truth
-├── inventory_2022.csv    # Climate ID lookup (2022)
-├── inventory_2014.csv    # Climate ID lookup (2014)
-└── test_images/               # Your test images
-    ├── 9904_2100500_1958_05_A.png
-    ├── 9904_2100630_1960_12.png
-    └── ...
+├── benchmark.py
+├── ground_truth.csv
+├── inventory_2014.csv
+├── inventory_2022.csv
+└── test_images/          # the 150 scans named in ground_truth.csv
 ```
 
-Create a tarball for upload:
 ```bash
 tar -czvf ec_benchmark.tar.gz ec_benchmark/
 ```
 
----
+## 1. Rent the instance (vast.ai)
 
-## Step 2: Rent a GPU on vast.ai
+- 1× H200 (SXM or NVL)
+- Disk ≥ 250 GB (the four models total ~150 GB, plus pip packages and results)
+- Max CUDA ≥ 12.9 (vLLM 0.29 wheels are built against CUDA 12.9)
+- Host RAM ≥ 64 GB is comfortable at the 16 MiP rung
+- Any recent PyTorch/CUDA template image
 
-### 2.1 Create Account
-1. Go to https://vast.ai and create an account
-2. Add credits
+## 2. Set up (on the instance)
 
-### 2.2 Choose a GPU Instance
-
-**For RTX 6000 Ada (~$0.60/hour):**
-- Good for: 32B models at FP8, lower parameter models at FP16
-- Search filters: `gpu_name = RTX 6000 Ada`, `disk_space >= 100GB`
-
-**For H200 SXM (~$2.50/hour):**
-- Good for: 32B models at FP16 precision, higher at FP8 (or lower) precision
-- Search filters: `gpu_name = H200`, `disk_space >= 200GB`
-
-### 2.3 Launch Instance
-1. Select an instance with:
-   - At least 100GB disk space
-   - Docker image: CUDA
-   
-2. Click "Rent" and wait for instance to start
-
-3. Note the SSH connection string (looks like: `ssh -p 12345 root@123.45.67.89`)
-
----
-
-## Step 3: Upload and Run Benchmarks
-
-### 3.1 Connect via SSH
 ```bash
-ssh -p <PORT> root@<IP_ADDRESS>
+scp -P <PORT> ec_benchmark.tar.gz root@<IP>:/root/        # from your machine
+ssh -p <PORT> root@<IP>
+tmux new -s bench                                          # survives SSH drops; reattach: tmux a -t bench
+cd /root && tar -xzf ec_benchmark.tar.gz && cd ec_benchmark
+pip install vllm==0.29.0                                   # pulls torch and transformers>=5.10
+python -c "import vllm, transformers; print(vllm.__version__, transformers.__version__)"
+
+# Start all model downloads in the background while you smoke-test
+for m in Qwen/Qwen3-VL-8B-Instruct Qwen/Qwen3-VL-32B-Instruct Qwen/Qwen3.8-27B datalab-to/chandra-ocr-2; do
+  nohup hf download $m > dl_$(basename $m).log 2>&1 &
+done
 ```
 
-### 3.2 Upload Benchmark Package
-From a **new local terminal**:
+## 3. Smoke test (~5 min)
+
 ```bash
-scp -P <PORT> ec_benchmark.tar.gz root@<IP_ADDRESS>:/root/
+ARGS="--image-dir test_images --ground-truth ground_truth.csv --inventory-2014 inventory_2014.csv --inventory-2022 inventory_2022.csv --usd-per-hour <your H200 rate>"
+python benchmark.py --model qwen3vl-8b --rungs 2 --limit 8 --output-dir smoke $ARGS
 ```
 
-### 3.3 Setup Environment (on VM)
+The smoke test only checks that the pipeline works. Its accuracy and cost figures mean nothing: the first 8 files
+are all positives, and with 8 files a single slow request dominates the timing. Check that:
+- The startup line reports **0 files without a station match** (or a number you expected).
+- In `smoke/summary.csv`: `files` = 8, `sent_mp_max` ≤ 2.1, and `prompt_tokens_median` ≈ 2,300 (2,048 image tokens plus the prompt).
+- The JSONL outputs are real transcriptions, not errors or empty strings.
+
+A `truncated` output (`finish_reason: "length"`) is a model behaviour, not a script fault. Greedy decoding sometimes
+falls into a repetition loop on a hard scan. The full run reports how often it happens per config.
+
+## 4. Full run
+
+Leaving out `--limit` and `--rungs` runs all 150 files at each model's default rungs (see the test matrix).
+`ARGS` is repeated here because a shell variable is lost when you reconnect or open a new tmux window.
+
 ```bash
-cd /root
-tar -xzvf ec_benchmark.tar.gz
-cd ec_benchmark
+cd /root/ec_benchmark
+ARGS="--image-dir test_images --ground-truth ground_truth.csv --inventory-2014 inventory_2014.csv --inventory-2022 inventory_2022.csv --usd-per-hour <your H200 rate>"
+for m in qwen3vl-8b qwen3vl-32b qwen3.8-27b chandra2; do
+  python benchmark.py --model $m $ARGS 2>&1 | tee log_$m.txt
+done
 ```
 
-### 3.4 Run Benchmarks
+Each rung's results are written as soon as it finishes, so a crash only loses the rung in progress. To redo one:
+`python benchmark.py --model qwen3vl-32b --rungs 16 $ARGS`. That appends another row to `summary.csv`; delete the stale one.
 
-**Run individual models**
+## 5. Download results and stop billing
+
 ```bash
-# Example: Qwen3-VL-8B at 16M resolution
-python benchmark.py \
-    --model 5 \
-    --image-dir ./images \
-    --ground-truth ./ground_truth.csv \
-    --inventory-2022 ./inventory_2022.csv \
-    --inventory-2014 ./inventory_2014.csv \
+scp -P <PORT> -r root@<IP>:/root/ec_benchmark/results ./     # from your machine
 ```
 
-### 3.5 Monitor Progress
-- Each file takes ~1-10 seconds depending on model
-- 100 files × 10 seconds = ~17 minutes per model
-- Watch for errors in the output
+Then **destroy** the instance in the vast.ai dashboard. A stopped instance still bills for its disk.
 
----
+## Outputs
 
-## Step 4: Download Results and Generate Report
+`results/<model>_<rung>MiP.jsonl` has one line per file: native and sent size, prompt/output token counts,
+`finish_reason`, the model output, the ground truth, and the per-file scores.
 
-### 4.1 Download Results (from local terminal)
-```bash
-scp -P <PORT> -r root@<IP_ADDRESS>:/root/ec_benchmark/results ./
-```
+`results/summary.csv` has one row per model × rung:
 
-### 4.2 Destroy the VM
-**IMPORTANT:** Stop billing by destroying the instance in the vast.ai dashboard!
+| Column | Meaning |
+|---|---|
+| `sensitivity` [`_ci`] | Files with remarks that the model flagged (didn't answer NO_REMARKS), with Wilson 95% CI |
+| `specificity` [`_ci`] | Files without remarks that the model correctly answered NO_REMARKS |
+| `TP` `FN` `FP` `TN` | File-level detection counts |
+| `word_recall` | Mean over the 66 files with remarks: share of ground-truth words the model reproduced, in order. Misses count as 0 |
+| `word_precision` | Mean over files where the model output something: share of output words that are in the ground truth. Over-extraction lowers it |
+| `word_f1` | Per-file harmonic mean of the two, averaged over the 66 files. Misses count as 0 |
+| `truncated` | Outputs that hit `max_tokens` (512 for extraction): almost always repetition loops |
+| `sent_mp_*` | Megapixels actually sent to the model |
+| `sec_per_file` | GPU wall-clock ÷ files, measured with batched requests |
+| `corpus_days`, `corpus_usd` | Projection to 571,712 files on one H200 at `--usd-per-hour` |
+| `calls` | Number of `llm.chat` calls the rung was split into (see Caveats) |
 
----
+Words are compared lower-cased and accent-folded, with digits and punctuation ignored. Line breaks don't affect the score.
+File-level precision is not reported: it depends on how common remarks are, and this test set is 44% positive by
+construction. Use sensitivity and specificity, and project precision once the corpus rate is estimated.
 
-## Test Matrix
+## Caveats
 
-| # | Model | Max Resolution | GPU |
-|---|-------|----------------|-----|
-| 1 | Qwen/Qwen3-VL-4B-Instruct | 16M | RTX A6000 |
-| 2 | Qwen/Qwen3-VL-4B-Instruct | 8M | RTX A6000 |
-| 3 | Qwen/Qwen3-VL-4B-Instruct | 4M | RTX A6000 |
-| 4 | Qwen/Qwen3-VL-4B-Instruct | 2M | RTX A6000 |
-| 5 | Qwen/Qwen3-VL-8B-Instruct | 16M | RTX A6000 |
-| 6 | Qwen/Qwen3-VL-8B-Instruct | 8M | RTX A6000 |
-| 7 | Qwen/Qwen3-VL-8B-Instruct | 4M | RTX A6000 |
-| 8 | Qwen/Qwen3-VL-8B-Instruct | 2M | RTX A6000 |
-| 9 | Qwen/Qwen3-VL-32B-Instruct | 16M | H200 |
-| 10 | Qwen/Qwen3-VL-32B-Instruct | 8M | H200 |
-| 11 | Qwen/Qwen3-VL-32B-Instruct | 4M | H200 |
-| 12 | Qwen/Qwen3-VL-32B-Instruct | 2M | H200 |
-
----
-
-## Output Files
-
-After running benchmarks, you'll have:
-
-```
-results/
-├── Qwen3-VL-4B-16M_detailed_results.jsonl
-├── Qwen3-VL-8B-16M_detailed_results.jsonl
-├── Qwen3-VL-32B-16M_detailed_results.jsonl
-├── benchmark_summary.json
-└── ...
-```
-
----
+- Each `llm.chat` call ends only when its slowest request finishes. One looping output (up to 512 tokens) can keep
+  the GPU mostly idle for several seconds at the end of a call. `--batch-megapixels` (default 1000) keeps this to one
+  call per rung at ≤6 MiP and 2–3 calls at 8/16 MiP. A production server keeps requests continuously in flight,
+  so a loop there only occupies one slot. Treat `sec_per_file` as a slightly conservative estimate, most of all
+  for configs with a high `truncated` count.
+- Decoding is greedy with a fixed seed. vLLM results can still differ in the last digit between batch sizes, so compare configs on
+  their confidence intervals, not on one-file differences.
+- The production run is only as fast as scans can reach the GPU. Check that your upload bandwidth can sustain
+  (file size ÷ `sec_per_file`) at the chosen rung.
+- Chandra's own client retries repetition loops at a higher temperature. This probe doesn't, and flags them in `truncated` instead.
 
 ## Troubleshooting
 
-### "CUDA out of memory"
-- Try FP8 quantization instead of FP16
-- Reduce `max_num_seqs` in MODEL_CONFIGS
-- Use a GPU with more VRAM
-
-### Model download is slow
-- vast.ai instances have fast internet; model download should be ~5-10 min for large models
-- Consider instances with more bandwidth
-
-### SSH connection refused
-- Wait a few minutes for instance to fully start
-- Check if instance is "Running" in dashboard
-- Use the Jupyter Notebook (installed by default with most instances)
-
-### vLLM errors
-- Some model architectures may not be fully supported
-- Check vLLM GitHub issues and Wiki for your specific model
-
----
-
-## Cost Control Tips
-
-1. **Test one model first** before running the full suite
-2. **Use spot/interruptible instances** if available (cheaper but may be preempted)
-3. **Destroy instances immediately** after downloading results
-4. **Monitor costs** in vast.ai dashboard
+- **Host RAM runs out (process killed at 8/16 MiP):** rerun that rung with `--batch-megapixels 400`. Check
+  headroom first with `free -g`; the default needs roughly 30 GB free.
+- **CUDA OOM while loading or at 16 MiP:** lower `gpu_memory_utilization` (0.90) in the `LLM(...)` call.
+- **A model fails to load:** check the `transformers` version printed in setup (Qwen3.8 needs ≥ 5.8), and look at vLLM's model support issues on GitHub.

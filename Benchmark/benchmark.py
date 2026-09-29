@@ -1,378 +1,110 @@
 #!/usr/bin/env python3
 """
-EC Weather Remarks - VLM Benchmark Script v8
-Addresses critical issues from v7 code review.
+EC Weather Remarks - VLM benchmark v9 (single H200).
 
-Fixes from v7:
-1. Qwen3-VL: Added thinking block stripping from output
-2. Stop tokens: Made model-specific (ChatML for Qwen)
-3. Image format: Created model-family-specific image passing formats
-4. Patch size: Now model-specific (32 for Qwen3-VL)
+One invocation = one model, all of its resolution rungs, one model load.
 
-References:
-- vLLM supported models: https://docs.vllm.ai/en/latest/models/supported_models.html
-- Qwen3 thinking mode: https://qwen.readthedocs.io/en/latest/deployment/vllm.html
+Fixes from v8 (details in the v8 audit):
+  1. Mis-read positives are no longer dropped from recall/precision. Scoring is split into
+     (a) file-level detection (sensitivity/specificity with Wilson 95% CIs) and
+     (b) word-level transcription accuracy on files that have remarks. Word alignment is
+     order-preserving and one-to-one, ignores line breaks, and over-extraction lowers precision.
+  2. "NO_REMARKS" is recognised with surrounding punctuation/whitespace, not as an exact string.
+  3. Class-mixing accuracy% removed.
+  4. Resize by pixel budget only (no aspect-ratio-dependent max_dim cap), sides floored to
+     multiples of 32 px, never upscaled. Sent size and prompt token count are logged per file.
+  5. Greedy decoding with a fixed seed (v8: temperature 0.1, no seed).
+  6. Requests are submitted in batches and GPU wall-clock is timed, so cost comes from
+     throughput (v8 timed one request at a time).
+  7. finish_reason logged, so truncated/looping outputs are visible.
+  8. Station lookup accepts the same header variants as the organizer script (2022 first).
+
+New models: Qwen3.8-27B (thinking disabled) and a Chandra OCR 2 recall probe.
 """
 
 import argparse
 import csv
+import difflib
+import html
 import json
 import math
-import os
 import re
-import sys
+import statistics
 import time
-from dataclasses import dataclass, field
-from enum import Enum
+import unicodedata
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
+
 from PIL import Image
 
-# Check dependencies at startup
-def check_dependencies():
-    """Check if required packages are installed."""
-    missing = []
-    try:
-        import vllm
-        print(f"vLLM version: {vllm.__version__}")
-    except ImportError:
-        missing.append("vllm")
-    
-    if missing:
-        print(f"ERROR: Missing required packages: {missing}")
-        sys.exit(1)
+CORPUS_FILES = 571_712  # pre-1940 files in the production corpus
+MIB = 1024 * 1024       # rungs are in MiP: 2 MiP = 2,097,152 px, as in February
+GRID = 32               # patch 16 x spatial merge 2 for Qwen3-VL, Qwen3.8 and Chandra 2
 
-check_dependencies()
-
-from vllm import LLM, SamplingParams
-
-
-class ModelFamily(Enum):
-    """Model families with different requirements."""
-    QWEN3_VL = "qwen3-vl"
-
-
-@dataclass
-class ModelConfig:
-    """Configuration for a VLM model with family-specific settings."""
-    name: str
-    model_id: str
-    family: ModelFamily
-    dtype: str = "auto"
-    quantization: Optional[str] = None
-    gpu: str = "RTX A6000"
-    max_model_len: int = 32768
-    max_pixels: Optional[int] = None  # Per-model max pixels, None uses CLI default
-    trust_remote_code: bool = False
-    extra_vllm_args: dict = field(default_factory=dict)
-    
-    @property
-    def patch_size(self) -> int:
-        """Return the correct patch size for this model family."""
-        if self.family == ModelFamily.QWEN3_VL:
-            return 32
-        return 28  # Default fallback
-    
-    @property
-    def stop_tokens(self) -> List[str]:
-        """Return the correct stop tokens for this model family."""
-        if self.family == ModelFamily.QWEN3_VL:
-            # ChatML format stop tokens
-            return ["<|im_end|>", "<|endoftext|>"]
-        return ["<|im_end|>", "<|endoftext|>"]  # Default to ChatML
-    
-    @property
-    def has_thinking_mode(self) -> bool:
-        """Check if this model has thinking mode that needs stripping."""
-        return self.family == ModelFamily.QWEN3_VL
-
-
-# Model configurations - Testing Matrix
-# Each model size is tested at 4 resolutions (16M, 8M, 4M, 2M megapixels)
-MODEL_CONFIGS = {
-    # Qwen3-VL-4B (RTX A6000)
-    1: ModelConfig(
-        name="Qwen3-VL-4B-16M",
-        model_id="Qwen/Qwen3-VL-4B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=16_777_216,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    2: ModelConfig(
-        name="Qwen3-VL-4B-8M",
-        model_id="Qwen/Qwen3-VL-4B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=8_388_608,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    3: ModelConfig(
-        name="Qwen3-VL-4B-4M",
-        model_id="Qwen/Qwen3-VL-4B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=4_194_304,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    4: ModelConfig(
-        name="Qwen3-VL-4B-2M",
-        model_id="Qwen/Qwen3-VL-4B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=2_097_152,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    # Qwen3-VL-8B (RTX A6000)
-    5: ModelConfig(
-        name="Qwen3-VL-8B-16M",
-        model_id="Qwen/Qwen3-VL-8B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=16_777_216,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    6: ModelConfig(
-        name="Qwen3-VL-8B-8M",
-        model_id="Qwen/Qwen3-VL-8B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=8_388_608,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    7: ModelConfig(
-        name="Qwen3-VL-8B-4M",
-        model_id="Qwen/Qwen3-VL-8B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=4_194_304,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    8: ModelConfig(
-        name="Qwen3-VL-8B-2M",
-        model_id="Qwen/Qwen3-VL-8B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="RTX A6000",
-        max_pixels=2_097_152,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    # Qwen3-VL-32B (H200)
-    9: ModelConfig(
-        name="Qwen3-VL-32B-16M",
-        model_id="Qwen/Qwen3-VL-32B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="H200",
-        max_pixels=16_777_216,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    10: ModelConfig(
-        name="Qwen3-VL-32B-8M",
-        model_id="Qwen/Qwen3-VL-32B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="H200",
-        max_pixels=8_388_608,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    11: ModelConfig(
-        name="Qwen3-VL-32B-4M",
-        model_id="Qwen/Qwen3-VL-32B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="H200",
-        max_pixels=4_194_304,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
-    12: ModelConfig(
-        name="Qwen3-VL-32B-2M",
-        model_id="Qwen/Qwen3-VL-32B-Instruct",
-        family=ModelFamily.QWEN3_VL,
-        dtype="bfloat16",
-        gpu="H200",
-        max_pixels=2_097_152,
-        extra_vllm_args={"limit_mm_per_prompt": {"image": 1, "video": 0}},
-    ),
+EXTRACT, OCR_PROBE = "extract", "ocr_probe"
+MODELS = {
+    "qwen3vl-8b":  {"id": "Qwen/Qwen3-VL-8B-Instruct",  "rungs": [2, 4, 8, 16]},
+    "qwen3vl-32b": {"id": "Qwen/Qwen3-VL-32B-Instruct", "rungs": [2, 4, 8, 16]},
+    "qwen3.8-27b": {"id": "Qwen/Qwen3.8-27B",           "rungs": [2, 4, 8, 16],
+                    "chat_template_kwargs": {"enable_thinking": False}},
+    # Chandra is trained only on fixed full-page OCR prompts, so it runs in its own "ocr" mode
+    # at its own default pixel budget (3072 x 2048 = 6 MiP) and is scored on word recall only:
+    # a go/no-go on a future OCR-then-filter pipeline, not a like-for-like competitor.
+    "chandra2":    {"id": "datalab-to/chandra-ocr-2",   "rungs": [6], "mode": OCR_PROBE,
+                    "max_tokens": 12384},
 }
 
+# Chandra's "ocr" prompt, copied verbatim from datalab-to/chandra (chandra/prompts.py).
+_TAGS = ["math", "br", "i", "b", "u", "del", "sup", "sub", "table", "tr", "td", "p", "th", "div",
+         "pre", "h1", "h2", "h3", "h4", "h5", "ul", "ol", "li", "input", "a", "span", "img", "hr",
+         "tbody", "small", "caption", "strong", "thead", "big", "code", "chem"]
+_ATTRS = ["class", "colspan", "rowspan", "display", "checked", "type", "border", "value", "style",
+          "href", "alt", "align", "data-bbox", "data-label"]
+CHANDRA_OCR_PROMPT = f"""OCR this image to HTML.
 
-# Image resizing configuration
-DEFAULT_MAX_IMAGE_PIXELS = 1024 * 1024  # ~1300 image tokens for Qwen
+Only use these tags {_TAGS}, and these attributes {_ATTRS}.
 
-
-def resize_image_for_vlm(image_path: Path, max_pixels: int, max_dim: int, 
-                          patch_size: int = 28) -> Image.Image:
-    """
-    Resize image to reduce token count while preserving aspect ratio.
-
-    For Qwen3-VL, image tokens ≈ (width * height) / (32 * 32)
-
-    Args:
-        image_path: Path to the image file
-        max_pixels: Maximum total pixels allowed
-        max_dim: Maximum dimension (width or height)
-        patch_size: Model-specific patch size (32 for Qwen3-VL)
-    """
-    img = Image.open(image_path)
-    
-    # Convert to RGB if necessary (handles RGBA, grayscale, palette, etc.)
-    if img.mode not in ('RGB', 'L'):
-        img = img.convert('RGB')
-    elif img.mode == 'L':
-        img = img.convert('RGB')
-    
-    original_size = img.size
-    width, height = img.size
-    
-    # Check if resize is needed
-    current_pixels = width * height
-    
-    if current_pixels <= max_pixels and width <= max_dim and height <= max_dim:
-        return img
-    
-    # Calculate scale factor
-    scale_by_pixels = (max_pixels / current_pixels) ** 0.5
-    scale_by_dim = min(max_dim / width, max_dim / height)
-    scale = min(scale_by_pixels, scale_by_dim)
-    
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-    
-    # Ensure dimensions are multiples of patch_size (model-specific)
-    new_width = (new_width // patch_size) * patch_size
-    new_height = (new_height // patch_size) * patch_size
-    
-    # Minimum size
-    min_size = patch_size * 8  # At least 8 patches per dimension
-    new_width = max(new_width, min_size)
-    new_height = max(new_height, min_size)
-    
-    img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    print(f"    Resized: {original_size} -> ({new_width}, {new_height}) "
-          f"[{current_pixels:,} -> {new_width*new_height:,} pixels, "
-          f"patch_size={patch_size}]")
-    
-    return img_resized
+Guidelines:
+* Inline math: Surround math with <math>...</math> tags. Math expressions should be rendered in KaTeX-compatible LaTeX. Use display for block math.
+* Tables: Use colspan and rowspan attributes to match table structure.
+* Formatting: Maintain consistent formatting with the image, including spacing, indentation, subscripts/superscripts, and special characters.
+* Images: Include a description of any images in the alt attribute of an <img> tag. Do not fill out the src property. Describe in detail inside the div tag. Also convert charts to high fidelity data, and convert diagrams to mermaid.
+* Forms: Mark checkboxes and radio buttons properly.
+* Text: join lines together properly into paragraphs using <p>...</p> tags.  Use <br> tags for line breaks within paragraphs, but only when absolutely necessary to maintain meaning.
+* Chemistry: Use <chem>...</chem> tags for chemical formulas with reactive SMILES.
+* Lists: Preserve indents and proper list markers.
+* Use the simplest possible HTML structure that accurately represents the content of the block.
+* Make sure the text is accurate and easy for a human to read and interpret.  Reading order should be correct and natural."""
 
 
-def strip_thinking_blocks(text: str) -> str:
-    """
-    Strip <think>...</think> blocks from Qwen3-VL output.
-    
-    Qwen3 models have thinking mode enabled by default, which generates
-    reasoning in <think> tags before the final response. For benchmark
-    accuracy, we only want the final response.
-    
-    Args:
-        text: Raw model output that may contain thinking blocks
-        
-    Returns:
-        Text with thinking blocks removed
-    """
-    # Pattern matches <think>...</think> including newlines
-    # Uses DOTALL flag to match across multiple lines
-    pattern = r'<think>.*?</think>'
-    cleaned = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
-    
-    # Also handle potential variations
-    pattern2 = r'<\|think\|>.*?<\|/think\|>'
-    cleaned = re.sub(pattern2, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
-    
-    # Clean up any resulting double newlines or leading/trailing whitespace
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    
-    return cleaned.strip()
+# --------------------------------------------------------------------------- inputs
 
-
-def build_qwen_messages(img: Image.Image, prompt: str) -> List[Dict[str, Any]]:
-    """
-    Build chat messages for Qwen3-VL models.
-    
-    Uses the image_pil format supported by vLLM for direct PIL image input.
-    """
-    return [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_pil",
-                    "image_pil": img,
-                },
-                {
-                    "type": "text",
-                    "text": prompt,
-                },
-            ],
-        }
-    ]
-
-
-def load_ground_truth(csv_path: Path) -> dict:
-    """Load ground truth data from CSV."""
-    ground_truth = {}
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            filename = row.get('filename', '')
-            if filename:
-                ground_truth[filename] = {
-                    'verified_extraction': row.get('verified_extraction', ''),
-                    'climate_id': row.get('climate_id', ''),
-                }
-    return ground_truth
-
-
-def load_station_inventories(inv_2014_path: Path, inv_2022_path: Path) -> dict:
-    """Load station inventory data for location context."""
+def load_stations(*paths):
+    """Climate ID -> (name, province). Earlier paths win (pass 2022 first, like the organizer)."""
+    def first(row, *keys):
+        return next((row[k] for k in keys if row.get(k)), "")
     stations = {}
-    
-    # Load 2014 inventory
-    if inv_2014_path.exists():
-        with open(inv_2014_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                climate_id = row.get('Climate ID', '').strip()
-                if climate_id:
-                    stations[climate_id] = {
-                        'name': row.get('Station Name (Current)', ''),
-                        'province': row.get('Province', ''),
-                    }
-    
-    # Load 2022 inventory (may have updated info)
-    if inv_2022_path.exists():
-        with open(inv_2022_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                climate_id = row.get('climate_id', '').strip()
-                if climate_id:
-                    stations[climate_id] = {
-                        'name': row.get('Name', ''),
-                        'province': row.get('Province', ''),
-                    }
-    
+    for path in paths:
+        if not path.exists():
+            print(f"WARNING: station inventory not found: {path}")
+            continue
+        with open(path, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                cid = first(row, "climate_id", "Climate ID", "CLIMATE ID").strip()
+                if cid and cid not in stations:
+                    stations[cid] = (first(row, "Name", "Station Name (Current)", "Station Name", "NAME").strip(),
+                                     first(row, "Province", "PROVINCE").strip())
     return stations
 
 
-def extract_climate_id(filename: str) -> str:
-    """Extract climate ID from filename like '9904_2100500_1958_05_A.png'."""
-    parts = filename.replace('.png', '').replace('.jpg', '').split('_')
-    if len(parts) >= 2:
-        return parts[1]
-    return ''
-
-
-def build_prompt(station_name: str, province: str, year: str, month: str) -> str:
-    """Build the extraction prompt with location context."""
-    return f"""You are analyzing a historical weather observation form from {station_name}, {province}, Canada from {year}-{month}.
+def build_prompt(filename, stations):
+    """February prompt, unchanged, so model comparisons aren't confounded with prompt changes."""
+    parts = Path(filename).stem.split("_")
+    name, province = stations.get(parts[1] if len(parts) > 1 else "", ("Unknown Station", "Unknown Province"))
+    year = parts[2] if len(parts) > 2 else "Unknown"
+    month = parts[3] if len(parts) > 3 else "Unknown"
+    return f"""You are analyzing a historical weather observation form from {name}, {province}, Canada from {year}-{month}.
 
 This form is part of a research project studying how Canadians understood and communicated about weather and nature, as seen in what they drew attention to. Your task is to extract handwritten qualitative remarks — observations that go beyond simple one-word weather states to describe, characterize, or comment on conditions.
 
@@ -394,452 +126,191 @@ When in doubt about whether a remark is qualitative, extract it.
 If there are no qualitative remarks, respond with exactly: NO_REMARKS
 If there are remarks, transcribe them exactly as written, one per line. Preserve original spelling, grammar, and language. Do not add explanations, categories, or formatting."""
 
-def is_no_remarks(text: str) -> bool:
-    """
-    Check if text indicates "no remarks".
-    Uses EXACT match only - not substring matching.
-    """
-    text_upper = text.upper().strip()
-    
-    # Empty or whitespace only
-    if not text_upper:
-        return True
-    
-    # Exact matches only (not substring!)
-    no_remarks_indicators = {"NO_REMARKS", "NO REMARKS", "NONE", "N/A", "NA", "NIL"}
-    if text_upper in no_remarks_indicators:
-        return True
-    
-    return False
+
+def load_resized(path, budget_px):
+    """Scale to at most budget_px pixels, sides floored to multiples of GRID, never upscaled.
+    The models' own processors leave such an image as-is, so sent size = what the model sees."""
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    s = min(1.0, math.sqrt(budget_px / (w * h)))
+    nw, nh = max(GRID, int(w * s) // GRID * GRID), max(GRID, int(h * s) // GRID * GRID)
+    if (nw, nh) != (w, h):
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    return img, (w, h)
 
 
-def calculate_accuracy(model_output: str, ground_truth: str) -> tuple:
-    """
-    Calculate if model output matches ground truth.
-    Returns (is_match: bool, match_type: str)
-    
-    Match types:
-    - exact: Strings match exactly (case-insensitive, whitespace-normalized)
-    - true_negative: Both correctly indicate no remarks
-    - partial_XX%: At least 50% of ground truth lines have matching content
-    - false_negative: Model said NO_REMARKS but ground truth has content (MISS)
-    - false_positive: Model has content but ground truth says NO_REMARKS (HALLUCINATION)
-    - no_match_XX%: Both have content but insufficient overlap
-    """
-    model_clean = model_output.strip()
-    gt_clean = ground_truth.strip()
-    
-    # Determine if each indicates "no remarks" FIRST
-    # This must happen before exact match to correctly classify true negatives.
-    # Otherwise, both saying "NO_REMARKS" matches exactly and gets counted as
-    # a true positive in the summary metrics, inflating precision/recall/F1.
-    model_no_remarks = is_no_remarks(model_clean)
-    gt_no_remarks = is_no_remarks(gt_clean)
-    
-    # Both indicate no remarks - TRUE NEGATIVE
-    if model_no_remarks and gt_no_remarks:
-        return True, "true_negative"
-    
-    # Model says no remarks but ground truth has content - FALSE NEGATIVE (miss)
-    if model_no_remarks and not gt_no_remarks:
-        return False, "false_negative"
-    
-    # Model has output but ground truth says no remarks - FALSE POSITIVE (hallucination)
-    if not model_no_remarks and gt_no_remarks:
-        return False, "false_positive"
-    
-    # Both have content - check exact match first
-    # Normalize for comparison
-    model_normalized = ' '.join(model_clean.upper().split())
-    gt_normalized = ' '.join(gt_clean.upper().split())
-    
-    if model_normalized == gt_normalized:
-        return True, "exact"
-    
-    # Both have content - check partial match using word overlap
-    model_lines = [l.strip() for l in model_clean.split('\n') if l.strip()]
-    gt_lines = [l.strip() for l in gt_clean.split('\n') if l.strip()]
-    
-    if not gt_lines:
-        # Edge case: gt appears empty after splitting but wasn't caught above
-        return False, "empty_gt"
-    
-    # Count how many ground truth lines have a matching model line
-    # A match requires at least 50% word overlap
-    matches = 0
-    for gt_line in gt_lines:
-        gt_words = set(gt_line.upper().split())
-        if not gt_words:
-            continue
-            
-        best_overlap = 0
-        for model_line in model_lines:
-            model_words = set(model_line.upper().split())
-            if model_words:
-                # Overlap = intersection / ground truth words
-                overlap = len(gt_words & model_words) / len(gt_words)
-                best_overlap = max(best_overlap, overlap)
-        
-        if best_overlap >= 0.5:  # At least 50% of GT words found
-            matches += 1
-    
-    match_ratio = matches / len(gt_lines) if gt_lines else 0
-    
-    # At least 50% of ground truth lines must match
-    if match_ratio >= 0.5:
-        return True, f"partial_{int(match_ratio*100)}%"
-    
-    return False, f"no_match_{int(match_ratio*100)}%"
+# --------------------------------------------------------------------------- scoring
+
+NONE_RE = re.compile(r"\W*no[\s_-]*remarks\W*", re.IGNORECASE)
 
 
-def run_benchmark(config: ModelConfig, ground_truth: dict, stations: dict,
-                  image_dir: Path, output_dir: Path, max_pixels: int, max_dim: int) -> dict:
-    """Run benchmark for a single model configuration."""
-    # CLI --max-pixels always takes precedence over per-model defaults.
-    # Per-model max_pixels is only used if no CLI value was provided (i.e., using the
-    # script's DEFAULT_MAX_IMAGE_PIXELS). This prevents silent overrides when the user
-    # explicitly specifies a resolution.
-    if max_pixels != DEFAULT_MAX_IMAGE_PIXELS:
-        # User explicitly set --max-pixels on CLI, always use it
-        effective_max_pixels = max_pixels
-        if config.max_pixels is not None and config.max_pixels != max_pixels:
-            print(f"  NOTE: CLI --max-pixels ({max_pixels:,}) overrides "
-                  f"per-model default ({config.max_pixels:,}) for {config.name}")
-    else:
-        # No explicit CLI value, use per-model default if available
-        effective_max_pixels = config.max_pixels if config.max_pixels is not None else max_pixels
-    effective_max_dim = int(math.ceil(math.sqrt(effective_max_pixels * 1.5)))
+def clean(text):
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    print(f"\n{'='*80}")
-    print(f"Testing model: {config.name}")
-    print(f"Model ID: {config.model_id}")
-    print(f"Model Family: {config.family.value}")
-    print(f"DType: {config.dtype}")
-    print(f"Quantization: {config.quantization or 'None'}")
-    print(f"Max Model Len: {config.max_model_len}")
-    print(f"GPU: {config.gpu}")
-    print(f"Patch Size: {config.patch_size}")
-    print(f"Stop Tokens: {config.stop_tokens}")
-    print(f"Has Thinking Mode: {config.has_thinking_mode}")
-    print(f"Max Image Pixels: {effective_max_pixels:,}")
-    print(f"Max Image Dimension: {effective_max_dim}")
-    print(f"{'='*80}\n")
-    
-    # Build vLLM arguments
-    vllm_args = {
-        "model": config.model_id,
-        "dtype": config.dtype,
-        "max_model_len": config.max_model_len,
-        "gpu_memory_utilization": 0.95,
-        "disable_log_stats": True,
-        "trust_remote_code": config.trust_remote_code,
-    }
 
-    # Add limit_mm_per_prompt only if not already in extra_vllm_args
-    if "limit_mm_per_prompt" not in config.extra_vllm_args:
-        vllm_args["limit_mm_per_prompt"] = {"image": 1}
+def says_none(text):
+    return not text.strip() or NONE_RE.fullmatch(text.strip()) is not None
 
-    if config.quantization:
-        vllm_args["quantization"] = config.quantization
 
-    # Apply extra model-specific args
-    vllm_args.update(config.extra_vllm_args)
-    
-    # Initialize vLLM
-    print("Initializing vLLM...")
-    print(f"vLLM args: {json.dumps({k: str(v) for k, v in vllm_args.items()}, indent=2)}")
-    try:
-        llm = LLM(**vllm_args)
-        print("vLLM initialized successfully\n")
-    except Exception as e:
-        print(f"ERROR: Failed to initialize vLLM: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "config": config.name}
-    
-    # Use model-specific stop tokens
-    sampling_params = SamplingParams(
-        temperature=0.1,
-        max_tokens=1024,
-        stop=config.stop_tokens,
-    )
-    
-    results = []
-    total_time = 0
-    successful = 0
-    errors = 0
-    
-    # Detailed accuracy counters
-    match_counts = {
-        "exact": 0,
-        "true_negative": 0,
-        "partial": 0,
-        "false_negative": 0,
-        "false_positive": 0,
-        "no_match": 0,
-    }
-    
-    # Process each test image
-    test_files = sorted([f for f in ground_truth.keys() if (image_dir / f).exists()])
-    
-    if not test_files:
-        print(f"ERROR: No test files found in {image_dir}")
-        return {"error": "No test files found", "config": config.name}
-    
-    print(f"Found {len(test_files)} test files\n")
-    
-    for idx, filename in enumerate(test_files, 1):
-        print(f"Processing [{idx}/{len(test_files)}]: {filename}")
-        
-        image_path = image_dir / filename
-        gt_data = ground_truth[filename]
-        
-        # Get location context
-        climate_id = extract_climate_id(filename)
-        station_info = stations.get(climate_id, {})
-        station_name = station_info.get('name', 'Unknown Station')
-        province = station_info.get('province', 'Unknown Province')
-        
-        # Extract year and month from filename
-        parts = filename.replace('.png', '').replace('.jpg', '').split('_')
-        year = parts[2] if len(parts) > 2 else 'Unknown'
-        month = parts[3] if len(parts) > 3 else 'Unknown'
-        
-        # Build prompt
-        prompt = build_prompt(station_name, province, year, month)
-        
-        try:
-            # Resize image using model-specific patch size and pixel limits
-            img = resize_image_for_vlm(
-                image_path,
-                max_pixels=effective_max_pixels,
-                max_dim=effective_max_dim,
-                patch_size=config.patch_size
-            )
-            
-            # Build chat messages and run inference
-            messages = build_qwen_messages(img, prompt)
+def words(text):
+    """Lower-cased letter-only tokens, accents folded, HTML stripped. Digits and punctuation
+    are ignored: numbers aren't target content and GT uses day-number prefixes ("7: brume")."""
+    text = html.unescape(re.sub(r"<[^>]*>", " ", text)).lower()
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return re.findall(r"[^\W\d_]+", text)
 
-            start_time = time.time()
-            outputs = llm.chat(messages, sampling_params=sampling_params)
-            elapsed = time.time() - start_time
-            
-            if outputs and outputs[0].outputs:
-                model_output = outputs[0].outputs[0].text.strip()
-                
-                # Strip thinking blocks for Qwen3-VL
-                if config.has_thinking_mode:
-                    original_output = model_output
-                    model_output = strip_thinking_blocks(model_output)
-                    if model_output != original_output:
-                        print(f"    Stripped thinking blocks from output")
-                
-                total_time += elapsed
-                successful += 1
-                
-                # Calculate accuracy
-                is_match, match_type = calculate_accuracy(
-                    model_output, gt_data['verified_extraction']
-                )
-                
-                # Update match counts
-                if match_type == "exact":
-                    match_counts["exact"] += 1
-                elif match_type == "true_negative":
-                    match_counts["true_negative"] += 1
-                elif match_type.startswith("partial"):
-                    match_counts["partial"] += 1
-                elif match_type == "false_negative":
-                    match_counts["false_negative"] += 1
-                elif match_type == "false_positive":
-                    match_counts["false_positive"] += 1
-                else:  # no_match_XX%
-                    match_counts["no_match"] += 1
-                
-                results.append({
-                    "filename": filename,
-                    "climate_id": climate_id,
-                    "station_name": station_name,
-                    "province": province,
-                    "model_output": model_output,
-                    "ground_truth": gt_data['verified_extraction'],
-                    "is_match": is_match,
-                    "match_type": match_type,
-                    "time_seconds": elapsed,
-                    "error": None,
-                })
-                
-                status = "✓" if is_match else "✗"
-                print(f"  {status} Processed in {elapsed:.2f}s ({match_type})")
-            else:
-                errors += 1
-                results.append({
-                    "filename": filename,
-                    "error": "No output generated",
-                })
-                print(f"  ERROR: No output generated")
-                
-        except Exception as e:
-            errors += 1
-            error_msg = str(e)
-            # Truncate long error messages
-            if len(error_msg) > 500:
-                error_msg = error_msg[:500] + "..."
-            results.append({
-                "filename": filename,
-                "error": error_msg,
-            })
-            print(f"  ERROR: {error_msg}")
-    
-    # Save detailed results
-    output_file = output_dir / f"{config.name.replace(' ', '_')}_detailed_results.jsonl"
-    with open(output_file, 'w') as f:
-        for r in results:
-            f.write(json.dumps(r) + '\n')
-    print(f"\nSaved detailed results to {output_file}")
-    
-    # Calculate summary statistics
-    matches = sum(1 for r in results if r.get('is_match', False))
-    accuracy = (matches / successful * 100) if successful > 0 else 0
-    avg_time = (total_time / successful) if successful > 0 else 0
-    
-    # Calculate more detailed metrics
-    true_positives = match_counts["exact"] + match_counts["partial"]
-    true_negatives = match_counts["true_negative"]
-    false_positives = match_counts["false_positive"]
-    false_negatives = match_counts["false_negative"]
-    
-    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    summary = {
-        "model_name": config.name,
-        "model_id": config.model_id,
-        "model_family": config.family.value,
-        "gpu": config.gpu,
-        "patch_size": config.patch_size,
-        "max_pixels": effective_max_pixels,
-        "max_dim": effective_max_dim,
-        "total_files": len(test_files),
-        "successful": successful,
-        "errors": errors,
-        "matches": matches,
-        "accuracy_percent": round(accuracy, 2),
-        "avg_time_seconds": round(avg_time, 2),
-        "total_time_seconds": round(total_time, 2),
-        "match_breakdown": {
-            "exact_matches": match_counts["exact"],
-            "partial_matches": match_counts["partial"],
-            "true_negatives": match_counts["true_negative"],
-            "false_negatives": match_counts["false_negative"],
-            "false_positives": match_counts["false_positive"],
-            "no_match": match_counts["no_match"],
-        },
-        "precision": round(precision * 100, 2),
-        "recall": round(recall * 100, 2),
-        "f1_score": round(f1 * 100, 2),
-    }
-    
-    # Print detailed breakdown
-    print(f"\n{'='*60}")
-    print("DETAILED ACCURACY BREAKDOWN")
-    print(f"{'='*60}")
-    print(f"  Exact matches:        {match_counts['exact']:>5}")
-    print(f"  Partial matches:      {match_counts['partial']:>5}")
-    print(f"  True negatives:       {match_counts['true_negative']:>5}")
-    print(f"  False negatives:      {match_counts['false_negative']:>5} (model missed remarks)")
-    print(f"  False positives:      {match_counts['false_positive']:>5} (model hallucinated)")
-    print(f"  No match:             {match_counts['no_match']:>5}")
-    print(f"{'='*60}")
-    print(f"  Precision: {precision*100:.1f}%  Recall: {recall*100:.1f}%  F1: {f1*100:.1f}%")
-    print(f"{'='*60}")
-    
-    # Clean up
-    del llm
-    
-    return summary
 
+def matched_words(gt, out):
+    """Words aligned in order, each used at most once (line breaks don't matter)."""
+    blocks = difflib.SequenceMatcher(None, gt, out, autojunk=False).get_matching_blocks()
+    return sum(b.size for b in blocks)
+
+
+def score(output, ground_truth, mode):
+    gt_pos, out_pos = not says_none(ground_truth), not says_none(output)
+    r = {"gt_has_remarks": gt_pos, "model_has_remarks": out_pos}
+    if mode == EXTRACT:
+        r["detection"] = {(True, True): "TP", (True, False): "FN",
+                          (False, True): "FP", (False, False): "TN"}[(gt_pos, out_pos)]
+    if gt_pos:
+        g, o = words(ground_truth), (words(output) if out_pos else [])
+        m = matched_words(g, o)
+        r["word_recall"] = m / len(g) if g else None
+        r["word_precision"] = m / len(o) if o else None   # undefined when nothing was output
+        r["word_f1"] = 2 * m / (len(g) + len(o)) if g else None   # 0 for a miss
+    return r
+
+
+SUMMARY_FIELDS = ["config", "model_id", "mode", "budget_px", "files", "positives",
+                  "sensitivity", "sensitivity_ci", "specificity", "specificity_ci", "TP", "FN", "FP", "TN",
+                  "word_recall", "word_precision", "word_f1", "truncated",
+                  "sent_mp_median", "sent_mp_min", "sent_mp_max", "prompt_tokens_median",
+                  "gpu_seconds", "sec_per_file", "corpus_days", "corpus_usd", "usd_per_hour", "calls",
+                  "vllm", "utc"]
+
+
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return None
+    p, d = k / n, 1 + z * z / n
+    c, h = p + z * z / (2 * n), z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return [round(100 * (c - h) / d, 1), round(100 * (c + h) / d, 1)]
+
+
+def summarize(recs, mode, gpu_seconds, usd_per_hour):
+    pos = [r for r in recs if r["gt_has_remarks"]]
+
+    def mean(key):
+        vals = [r[key] for r in pos if r.get(key) is not None]
+        return round(100 * statistics.mean(vals), 1) if vals else None
+
+    s = {"files": len(recs), "positives": len(pos), "word_recall": mean("word_recall"),
+         "word_precision": mean("word_precision") if mode == EXTRACT else None,
+         "word_f1": mean("word_f1") if mode == EXTRACT else None}
+    if mode == EXTRACT:
+        c = Counter(r["detection"] for r in recs)
+        tp, fn, fp, tn = c["TP"], c["FN"], c["FP"], c["TN"]
+        s.update(TP=tp, FN=fn, FP=fp, TN=tn,
+                 sensitivity=round(100 * tp / (tp + fn), 1) if tp + fn else None,
+                 sensitivity_ci=wilson(tp, tp + fn),
+                 specificity=round(100 * tn / (tn + fp), 1) if tn + fp else None,
+                 specificity_ci=wilson(tn, tn + fp))
+    sec_per_file = gpu_seconds / len(recs)
+    mp = [r["sent_wh"][0] * r["sent_wh"][1] / 1e6 for r in recs]
+    s.update(truncated=sum(r["finish_reason"] == "length" for r in recs),
+             sent_mp_median=round(statistics.median(mp), 2),
+             sent_mp_min=round(min(mp), 2), sent_mp_max=round(max(mp), 2),
+             prompt_tokens_median=int(statistics.median(r["prompt_tokens"] for r in recs)),
+             gpu_seconds=round(gpu_seconds, 1), sec_per_file=round(sec_per_file, 3),
+             corpus_days=round(CORPUS_FILES * sec_per_file / 86400, 1),
+             corpus_usd=round(CORPUS_FILES * sec_per_file / 3600 * usd_per_hour),
+             usd_per_hour=usd_per_hour)
+    return s
+
+
+# --------------------------------------------------------------------------- run
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark VLM models for EC Weather Remarks extraction")
-    parser.add_argument("--ground-truth", type=Path, required=True, help="Path to ground_truth.csv")
-    parser.add_argument("--inventory-2014", type=Path, required=True, help="Path to 2014 station inventory CSV")
-    parser.add_argument("--inventory-2022", type=Path, required=True, help="Path to 2022 station inventory CSV")
-    parser.add_argument("--image-dir", type=Path, required=True, help="Directory containing test images")
-    parser.add_argument("--output-dir", type=Path, default=Path("benchmark_results"), help="Output directory")
-    parser.add_argument("--models", type=int, nargs="+", default=[1], 
-                        help=f"Model IDs to test. Available: {list(MODEL_CONFIGS.keys())}")
-    parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_IMAGE_PIXELS,
-                        help=f"Maximum image pixels (default: {DEFAULT_MAX_IMAGE_PIXELS})")
-    parser.add_argument("--max-dim", type=int, default=None,
-                        help="Maximum image dimension. Default: auto-calculated from max-pixels")
-    args = parser.parse_args()
-    
-    # Calculate max_dim if not specified
-    if args.max_dim is None:
-        args.max_dim = int(math.ceil(math.sqrt(args.max_pixels * 1.5)))
-    
-    print(f"\nImage resize settings: max_pixels={args.max_pixels:,}, max_dim={args.max_dim}\n")
-    
-    # Validate paths
-    if not args.ground_truth.exists():
-        print(f"ERROR: Ground truth file not found: {args.ground_truth}")
-        sys.exit(1)
-    if not args.image_dir.exists():
-        print(f"ERROR: Image directory not found: {args.image_dir}")
-        sys.exit(1)
-    
-    # Create output directory
+    ap = argparse.ArgumentParser(description="EC Weather Remarks VLM benchmark (v9)")
+    ap.add_argument("--model", required=True, choices=MODELS)
+    ap.add_argument("--rungs", type=float, nargs="+", help="Pixel budgets in MiP (default: the model's list)")
+    ap.add_argument("--image-dir", type=Path, required=True)
+    ap.add_argument("--ground-truth", type=Path, required=True)
+    ap.add_argument("--inventory-2014", type=Path, required=True)
+    ap.add_argument("--inventory-2022", type=Path, required=True)
+    ap.add_argument("--output-dir", type=Path, default=Path("results"))
+    ap.add_argument("--batch-megapixels", type=float, default=1000,
+                    help="Total pixels (millions) per llm.chat call. Default puts all 150 files in one call at "
+                         "<=6 MiP and splits 8/16 MiP into 2-3 calls. Lower it if host RAM runs out.")
+    ap.add_argument("--usd-per-hour", type=float, default=3.50, help="Your actual H200 rate, for projections")
+    ap.add_argument("--limit", type=int, help="Only the first N files (smoke test)")
+    args = ap.parse_args()
+
+    cfg = MODELS[args.model]
+    mode = cfg.get("mode", EXTRACT)
+    with open(args.ground_truth, encoding="utf-8-sig") as f:
+        gt = {r["filename"]: r["verified_extraction"] for r in csv.DictReader(f)}
+    files = sorted(f for f in gt if (args.image_dir / f).exists())
+    if len(files) < len(gt):
+        print(f"WARNING: {len(gt) - len(files)} ground-truth files missing from {args.image_dir}")
+    files = files[:args.limit] if args.limit else files
+    if not files:
+        raise SystemExit("No test images found.")
+    stations = load_stations(args.inventory_2022, args.inventory_2014)
+    unmatched = [f for f in files if f.split("_")[1] not in stations]
+    print(f"{len(files)} files, {len(stations)} stations loaded, {len(unmatched)} files without a station match")
+
+    from vllm import LLM, SamplingParams, __version__ as vllm_version  # late import so --help works anywhere
+
+    llm = LLM(model=cfg["id"], dtype="bfloat16", max_model_len=32768, gpu_memory_utilization=0.90,
+              limit_mm_per_prompt={"image": 1, "video": 0}, mm_processor_cache_gb=0, seed=0)
+    # 512 tokens is >2.5x the longest ground truth; a greedy repetition loop is cut off there
+    # instead of at 1024, which halves the time a looping request holds up the end of a batch.
+    params = SamplingParams(temperature=0.0, max_tokens=cfg.get("max_tokens", 512), seed=0)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load data
-    print(f"Loading ground truth from {args.ground_truth}...")
-    ground_truth = load_ground_truth(args.ground_truth)
-    print(f"Loaded {len(ground_truth)} test cases")
-    
-    print("Loading station inventories...")
-    stations = load_station_inventories(args.inventory_2014, args.inventory_2022)
-    print(f"Loaded {len(stations)} station records")
-    
-    # Run benchmarks
-    all_results = []
-    for model_id in args.models:
-        if model_id not in MODEL_CONFIGS:
-            print(f"WARNING: Unknown model ID {model_id}, skipping")
-            continue
-        
-        config = MODEL_CONFIGS[model_id]
-        result = run_benchmark(config, ground_truth, stations, args.image_dir, args.output_dir,
-                               max_pixels=args.max_pixels, max_dim=args.max_dim)
-        all_results.append(result)
-    
-    # Save summary
-    summary_file = args.output_dir / "benchmark_summary.json"
-    with open(summary_file, 'w') as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nBenchmark complete! Summary saved to {summary_file}")
-    
-    # Print summary table
-    print("\n" + "=" * 140)
-    print("BENCHMARK SUMMARY")
-    print("=" * 140)
-    print(f"{'Model':<30} {'Family':<15} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Avg Time':>10} {'GPU':<20}")
-    print("-" * 140)
-    for r in all_results:
-        if "error" in r and r.get("error"):
-            print(f"{r.get('config', 'Unknown'):<30} {'-':<15} {'ERROR':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':<20}")
-        else:
-            print(f"{r['model_name']:<30} {r['model_family']:<15} {r['accuracy_percent']:>9.1f}% {r['precision']:>9.1f}% "
-                  f"{r['recall']:>9.1f}% {r['f1_score']:>9.1f}% {r['avg_time_seconds']:>9.2f}s {r['gpu']:<20}")
-    print("=" * 140)
-    print("\nMatch type legend:")
-    print("  - exact: Model output exactly matches ground truth")
-    print("  - partial_XX%: At least 50% of ground truth lines found in model output")
-    print("  - true_negative: Both model and ground truth correctly indicate no remarks")
-    print("  - false_negative: Model said NO_REMARKS but ground truth has content (MISS)")
-    print("  - false_positive: Model produced content but ground truth says NO_REMARKS (HALLUCINATION)")
-    print("  - no_match_XX%: Both have content but insufficient overlap")
+    summary_csv = args.output_dir / "summary.csv"
+
+    for rung in args.rungs or cfg["rungs"]:
+        tag = f"{args.model}_{rung:g}MiP"
+        budget = int(rung * MIB)
+        print(f"\n=== {tag} ({cfg['id']}, budget {budget:,} px, mode {mode}) ===")
+        recs, gpu_seconds = [], 0.0
+        # Each llm.chat call ends only when its slowest request does, so fewer, larger calls keep
+        # one looping output from idling the GPU several times per rung.
+        per_call = max(1, int(args.batch_megapixels * 1e6 // budget))
+        for i in range(0, len(files), per_call):
+            chunk, convs, meta = files[i:i + per_call], [], []
+            for fn in chunk:  # resizing happens before the timer: production pre-resizes locally
+                img, native = load_resized(args.image_dir / fn, budget)
+                prompt = CHANDRA_OCR_PROMPT if mode == OCR_PROBE else build_prompt(fn, stations)
+                convs.append([{"role": "user", "content": [{"type": "image_pil", "image_pil": img},
+                                                           {"type": "text", "text": prompt}]}])
+                meta.append((fn, native, img.size))
+            t0 = time.perf_counter()
+            outs = llm.chat(convs, params, chat_template_kwargs=cfg.get("chat_template_kwargs"))
+            gpu_seconds += time.perf_counter() - t0
+            for (fn, native, sent), out in zip(meta, outs):
+                comp = out.outputs[0]
+                text = clean(comp.text)
+                recs.append({"filename": fn, "native_wh": list(native), "sent_wh": list(sent),
+                             "prompt_tokens": len(out.prompt_token_ids), "output_tokens": len(comp.token_ids),
+                             "finish_reason": comp.finish_reason, "output": text,
+                             "ground_truth": gt[fn], **score(text, gt[fn], mode)})
+
+        with open(args.output_dir / f"{tag}.jsonl", "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        s = {"config": tag, "model_id": cfg["id"], "mode": mode, "budget_px": budget,
+             **summarize(recs, mode, gpu_seconds, args.usd_per_hour),
+             "calls": math.ceil(len(files) / per_call),
+             "vllm": vllm_version, "utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        new_file = not summary_csv.exists()
+        with open(summary_csv, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, restval="")
+            if new_file:
+                w.writeheader()
+            w.writerow(s)
+        print(json.dumps(s, indent=2))
 
 
 if __name__ == "__main__":
