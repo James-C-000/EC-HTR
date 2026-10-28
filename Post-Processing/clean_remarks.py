@@ -3,12 +3,15 @@
 Conservative, non-destructive cleaning of the EC production-run remarks.
 
 Input : ec_remarks.parquet (one row per scan; `output` is the raw VLM transcription)
-Output: ec_remarks_clean.parquet  - every input row and column unchanged, plus:
+Output: ec_remarks_clean.parquet  - every input row and column unchanged (utc is written at
+                                  microsecond precision; its values are unchanged), plus:
             remarks_clean       kept lines, original order, one per distinct line; in forms that
                                 finished normally, a line that occurred N>1 times ends with " [×N]"
-                                (not shown for token-capped forms, where repeats are loop artifacts)
-            has_remarks_clean   True if any line was kept
-            n_lines_raw         non-empty lines in `output`
+                                (not shown for token-capped forms, where repeats are loop artifacts).
+                                Empty when nothing was kept; null for failed files
+            has_remarks_clean   True if any line was kept; null for failed files (has_remarks null),
+                                so a failed file never reads as having no remarks
+            n_lines_raw         non-empty lines in `output` of has_remarks rows (0 for NO_REMARKS rows)
             n_lines_clean       lines in remarks_clean
             n_removed_<rule>    distinct lines removed by each rule (see below)
         ec_remark_lines.parquet - one row per distinct line per form, kept AND removed,
@@ -22,12 +25,14 @@ Rules, applied to each distinct line of a form:
   repeat   : a line that recurs in the same form is kept once (first occurrence's text)
              and its count is shown as " [×N]". Not counted as a removal of content.
   symbols  : no letters or digits at all (stray marks, Vienna-congress weather symbols)
-  reading  : only numbers plus statistics/compass words or single letters
-             ("Max = 97.0 on 18th", "Mean 59", "NE 8", "Sept 14 a.m.")
+  reading  : at least one number, plus only statistics/compass/month words or single letters
+             ("Max = 97.0 on 18th", "Mean 59", "NE 8", "Sept 14 a.m."); or single letters alone.
+             Lines with no number ("Trace", "March", "Sunday") are left to the other rules
   zero_count: a printed summary-table entry with a zero count ("Aurora 0", "Gales 0")
   null_entry: only "No", "None", "Nil", "Nothing"
   cut_off_repeat: in a token-capped output, the cut-off final line when it is the start of
-             another line in the same form ("Qu" after "Quel Cool"); its content is in that line
+             another kept line in the same form ("Qu" after "Quel Cool", "Storm" after "Stormy");
+             its content is in that line. A line with no letters or digits never qualifies
   plain_weather: every word is plain weather-state, time, direction or function vocabulary
              ("Rain", "Cloudy", "Fine warm", "Light rain at night", "All day"), and the line
              has fewer than 8 words (longer plain-vocabulary narratives are kept).
@@ -35,10 +40,16 @@ Rules, applied to each distinct line of a form:
              heavy, strong, high, severe...), event words (storm, thunder, lightning, frost,
              hail, gale...), expressive words (beautiful, gloomy, sultry...), haze/smoke,
              thaw/freeze, month or season names, or anything misspelled/unrecognised.
+             Conservative for now: hot, cold, dry, drift(ing/ed), blowing and fall are not plain
+             vocabulary, so lines like "Hot & dry", "Snow drifting" or "Cold" are kept (possible
+             heat, cold, drought and blowing-snow events). Stricter filtering can come later.
 
-Usage: python clean_remarks.py ec_remarks.parquet OUTDIR
-Needs: duckdb, pyarrow, pandas
+Both files are written under temporary names and renamed once both are complete.
+
+Usage: python Post-Processing/clean_remarks.py runs/ec_remarks.parquet OUTDIR
+Needs: duckdb, pandas
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -49,16 +60,18 @@ import pandas as pd
 def W(s):
     return frozenset(s.split())
 
-# --- plain vocabulary: a line made only of these (plus numbers/ordinals/single letters) is removed
+# --- plain vocabulary: a line made only of these (plus numbers/ordinals/single letters) is removed.
+# Left out on purpose, so lines with them are kept: hot, hotter, cold, colder, dry, drier, drift, drifted,
+# drifting, blowing (heat, cold, drought, blowing snow) and fall (also the season).
 PLAIN = W("""
 clear clearing cleared clears cloudy cloud clouds clouded clouding cldy cloudless overcast fine fair dull
 bright sunny sunshine sun shining partly mostly good
 rain rains rained raining rainy rainfall shower showers showery showering drizzle drizzling drizzly
 sprinkle sprinkles sprinkling snow snows snowing snowed snowy snowfall flurries flurry snowflurries flakes
-sleet sleety precipitation precip drops falling fell fall
+sleet sleety precipitation precip drops falling fell
 fog foggy fogs mist misty
-warm warmer cold colder cool cooler hot hotter mild milder chilly damp wet dry drier
-wind winds windy breeze breezy breezes calm calms fresh gusty gust gusts blustery blowing drifting drift drifted
+warm warmer cool cooler mild milder chilly damp wet
+wind winds windy breeze breezy breezes calm calms fresh gusty gust gusts blustery
 unsettled changeable variable
 light lght lgt lt slight slightly little moderate mod gentle some few occasional occasionally intermittent
 intermittently continuous steady quite rather fairly generally
@@ -112,8 +125,10 @@ def rule_for(norm: str):
         return "symbols"
     alpha = [t for t in toks if not ORD.match(t)]
     nums = [t for t in toks if NUM.match(t)]
-    # reading: numbers/ordinals with only statistics, compass, month words or single letters
-    if all(len(t) < 2 or t in STAT for t in alpha):
+    # reading: numbers/ordinals with only statistics, compass, month words or single letters,
+    # or single letters alone
+    has_number = len(alpha) < len(toks)
+    if all(len(t) < 2 or t in STAT for t in alpha) and (has_number or all(len(t) < 2 for t in alpha)):
         return "reading"
     # zero_count: printed summary-table entry with a 0 count
     if nums and all(n == "0" for n in nums) and len(alpha) >= 1:
@@ -136,13 +151,35 @@ def rule_for(norm: str):
 RULES = ["symbols", "reading", "zero_count", "null_entry", "plain_weather", "cut_off_repeat"]
 
 
+def sql_path(p) -> str:
+    return str(p).replace("'", "''")
+
+
 def main(src: str, outdir: str):
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
+    final = {k: out / k for k in ("ec_remarks_clean.parquet", "ec_remark_lines.parquet")}
+    tmp = {k: out / f".{k}.tmp" for k in final}
+    for p in tmp.values():
+        p.unlink(missing_ok=True)
+    try:
+        write(src, tmp)
+        for k in final:
+            os.replace(tmp[k], final[k])
+    except BaseException:
+        for p in tmp.values():
+            p.unlink(missing_ok=True)
+        raise
+    print("wrote", final["ec_remarks_clean.parquet"], "and", final["ec_remark_lines.parquet"])
+
+
+def write(src: str, tmp: dict):
     con = duckdb.connect()
     con.execute("SET preserve_insertion_order=true")
     con.execute("SET memory_limit='5GB'")
-    con.execute(f"CREATE TABLE r AS SELECT row_number() OVER () - 1 AS _row, * FROM read_parquet('{src}')")
+    # _row = the row's position in the input file, so the output keeps the input's order
+    con.execute(f"""CREATE TABLE r AS SELECT file_row_number AS _row, * EXCLUDE (file_row_number)
+                    FROM read_parquet('{sql_path(src)}', file_row_number = true)""")
 
     # explode outputs of has_remarks rows into lines; normalise; group repeats within a form
     con.execute(r"""
@@ -173,7 +210,7 @@ def main(src: str, outdir: str):
             SELECT ln._row, arg_max(ln.norm, ln.line_no) AS norm
             FROM ln JOIN r USING (_row) WHERE r.finish_reason = 'length' GROUP BY ln._row)
         SELECT u._row, u.norm FROM ul u JOIN last USING (_row, norm)
-        WHERE u.times_in_form = 1 AND EXISTS (
+        WHERE u.times_in_form = 1 AND u.norm <> '' AND EXISTS (
             SELECT 1 FROM ul v JOIN cls c ON c.norm = v.norm
             WHERE v._row = u._row AND v.norm <> u.norm AND starts_with(v.norm, u.norm) AND c.removed_by IS NULL)""")
     con.execute("""
@@ -197,14 +234,14 @@ def main(src: str, outdir: str):
     con.execute(f"""
         COPY (
           SELECT r.* EXCLUDE (_row),
-                 coalesce(a.remarks_clean, '') AS remarks_clean,
-                 coalesce(a.n_lines_clean, 0) > 0 AS has_remarks_clean,
+                 CASE WHEN r.has_remarks IS NOT NULL THEN coalesce(a.remarks_clean, '') END AS remarks_clean,
+                 CASE WHEN r.has_remarks IS NOT NULL THEN coalesce(a.n_lines_clean, 0) > 0 END AS has_remarks_clean,
                  coalesce(c.n_lines_raw, 0)::INTEGER AS n_lines_raw,
                  coalesce(a.n_lines_clean, 0)::INTEGER AS n_lines_clean,
                  {zero}
           FROM r LEFT JOIN agg a USING (_row) LEFT JOIN ({raw_counts}) c USING (_row)
           ORDER BY r._row
-        ) TO '{out / "ec_remarks_clean.parquet"}' (FORMAT parquet, COMPRESSION zstd)""")
+        ) TO '{sql_path(tmp["ec_remarks_clean.parquet"])}' (FORMAT parquet, COMPRESSION zstd)""")
     con.execute(f"""
         COPY (
           SELECT r.source_path, r.filename, r.climate_id, r.station, r.province_normalized, r.year, r.month, r.run,
@@ -212,8 +249,7 @@ def main(src: str, outdir: str):
                  u.removed_by
           FROM ulc u JOIN r USING (_row)
           ORDER BY r._row, u.first_line_no
-        ) TO '{out / "ec_remark_lines.parquet"}' (FORMAT parquet, COMPRESSION zstd)""")
-    print("wrote", out / "ec_remarks_clean.parquet", "and", out / "ec_remark_lines.parquet")
+        ) TO '{sql_path(tmp["ec_remark_lines.parquet"])}' (FORMAT parquet, COMPRESSION zstd)""")
 
 
 if __name__ == "__main__":
