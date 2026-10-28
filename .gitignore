@@ -9,6 +9,7 @@ results/
 *.sqlite-journal
 *.provenance.json
 leftover_audit/
+audit_*.csv
 province_audit/
 integrity_*/
 organization_stats.*

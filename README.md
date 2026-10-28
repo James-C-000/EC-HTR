@@ -44,20 +44,23 @@ EC-HTR/
 │   ├── benchmark.py                   # v9 VLM benchmark (runs on the rented H200)
 │   └── ground_truth.csv               # Human-verified remarks for the 150 test scans
 │
-└── Production/                        # Stages 3-4: production run and exports
-    ├── production.py                  # Production run client (runs locally, talks to vLLM on the H200)
-    ├── tunnel.bat                     # SSH tunnel to the instance's vLLM server (fill in host and ports)
-    ├── gt150_paths.txt                # The 150 test scans on the drive, for the production check
-    ├── compare_v9.py                  # Checks production.py against v9 on those 150 scans
-    ├── extras_paths.txt               # The 2,901 alternative scans in RAW_DATA
-    ├── export_xlsx.py                 # Production JSONL -> Excel deliverable
-    └── export_db.py                   # Production JSONL -> Parquet + SQLite datasets
+├── Production/                        # Stages 3-4: production run and exports
+│   ├── production.py                  # Production run client (runs locally, talks to vLLM on the H200)
+│   ├── tunnel.bat                     # SSH tunnel to the instance's vLLM server (fill in host and ports)
+│   ├── gt150_paths.txt                # The 150 test scans on the drive, for the production check
+│   ├── compare_v9.py                  # Checks production.py against v9 on those 150 scans
+│   ├── extras_paths.txt               # The 2,901 alternative scans in RAW_DATA
+│   ├── export_xlsx.py                 # Production JSONL -> Excel deliverable
+│   └── export_db.py                   # Production JSONL -> Parquet + SQLite datasets
+│
+└── Post-Processing/                   # Stage 5: cleaning the remarks
+    └── clean_remarks.py               # Conservative line-level cleaning -> ec_remarks_clean / ec_remark_lines
 ```
 
 **Not in the repo:**
 - The scans. The 150 test scans are named in `ground_truth.csv` and `gt150_paths.txt`.
 - The ECCC station inventories (2014 and 2022 editions), which are not redistributed here. The scripts expect them as `inventory_2014.csv` and `inventory_2022.csv`, and the production commands below read them from `EC_Inventories/`.
-- Results: run JSONLs and logs, exports, and audit reports. `.gitignore` excludes them.
+- Results: run JSONLs and logs, exports, cleaned datasets, and audit reports. `.gitignore` excludes them.
 
 ---
 
@@ -286,6 +289,44 @@ The full-text index uses the porter stemmer, so `aurora` also matches `auroras`.
 | ok, `finish_reason = length` | 31,358 |
 
 `has_remarks` is True for most `finish_reason = length` rows, including loops of routine weather (e.g. "Fair & warm") that the project scope excludes. Filter on `finish_reason` when counting remarks.
+
+---
+
+## Stage 5: Post-Processing
+
+The raw output is noisy: two thirds of all output lines are in the 31,358 token-capped repetition loops, and much of the rest is routine weather (states like "Rain" or "Cloudy", wind directions, monthly statistics) that the project scope excludes. `Post-Processing/clean_remarks.py` cleans it line by line. It is **conservative and non-destructive**: `output` and every other input column stay exactly as produced, the cleaned text goes in new columns, and every removed line is listed with the rule that removed it. It needs `duckdb` and `pandas`.
+
+```bash
+pip install duckdb pandas
+python Post-Processing/clean_remarks.py runs/ec_remarks.parquet runs
+```
+
+It writes two files, under temporary names that are renamed once both are complete:
+
+- `ec_remarks_clean.parquet`: the rows of `ec_remarks.parquet`, plus `remarks_clean` (the kept lines in their original order, one per distinct line), `has_remarks_clean`, `n_lines_raw`, `n_lines_clean` and one `n_removed_<rule>` count per rule. In forms that finished normally, a line that occurred N > 1 times ends with ` [×N]`. `remarks_clean` and `has_remarks_clean` are null for the 16 failed files, so a failed file never reads as having no remarks.
+- `ec_remark_lines.parquet`: one row per distinct line per form (2,235,190 rows), kept or removed, with `removed_by` (null = kept).
+
+Lines are compared after lowercasing and stripping accents and punctuation. Repeats within a form are kept once. Then each distinct line is removed only if it matches one of these rules:
+
+| Rule | Removes | Example | Lines removed |
+|---|---|---|---|
+| `plain_weather` | Fewer than 8 words, all plain weather, time, direction or function words (some French included) | "Rain", "Fine warm", "Light rain at night" | 771,380 |
+| `reading` | At least one number with only statistics, compass or month words, or single letters alone | "Max = 97.0 on 18th", "NE 8" | 381,775 |
+| `zero_count` | A printed summary-table entry with a zero count | "Aurora 0", "Gales 0" | 5,922 |
+| `null_entry` | Only "No", "None", "Nil", "Nothing" | "None" | 5,186 |
+| `cut_off_repeat` | The cut-off last line of a capped output that begins a kept line in the same form | "Qu" after "Quel Cool" | 3,365 |
+| `symbols` | No letters or digits | ditto marks | 3,156 |
+
+Everything else is kept, including intensifiers (very, heavy, severe), event words (storm, thunder, frost, hail, gale), expressive words (gloomy, sultry), months and seasons, misspellings, plain-vocabulary narratives of 8+ words, and, for now, lines with hot, cold, dry, drift/drifting, blowing or fall (possible heat, cold, drought and blowing-snow events). No line with a phenology or phenomenon keyword (robin, geese, ice, thaw, aurora, smoke, frost, storm and so on) is removed by the vocabulary rules. The filter errs towards keeping: lines such as "Trace", "Sunday" or "Total" are kept because they carry no number, and can be filtered later.
+
+| | Before | After |
+|---|---|---|
+| Forms with remarks (main + extras) | 334,505 | 251,381 |
+| Forms with remarks (main) | 332,739 | 250,203 |
+| Output lines (non-empty) → distinct lines kept | 7,787,744 | 1,064,406 |
+| Characters | 74.1M | 22.8M |
+
+Kept lines are still mostly routine; the cleaning only removes lines that are clearly out of scope. To make it stricter later, edit the word lists in the script and re-run it; `ec_remark_lines.parquet` shows exactly which lines any change affects.
 
 ---
 
