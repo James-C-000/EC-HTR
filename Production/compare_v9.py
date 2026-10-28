@@ -9,16 +9,18 @@ Per file, matched by filename:
                  composition. "detection" says whether both agree on remarks vs NO_REMARKS.
 Exit code 0 when every v9 file has an ok production row whose sent_wh and prompt_tokens match.
 
-  python Benchmark/compare_v9.py runs/gt150.jsonl results/qwen3.8-27b_4MiP.jsonl --csv runs/compare_v9.csv
+  python Production/compare_v9.py runs/gt150.jsonl results/qwen3.8-27b_4MiP.jsonl --csv runs/compare_v9.csv
 """
 
 import argparse
 import csv
 import difflib
+import sys
 from pathlib import Path
 
-from benchmark import says_none
-from production import read_jsonl
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Benchmark"))   # v9's benchmark.py
+from benchmark import says_none  # noqa: E402
+from production import read_jsonl  # noqa: E402
 
 
 def main():

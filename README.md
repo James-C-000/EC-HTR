@@ -39,10 +39,12 @@ EC-HTR/
 │   ├── ec_check_integrity.py          # Pre-H200 check: counts, names, full decode of every scan
 │   └── ec_leftover_audit.py           # Compares pre-1940 files left in RAW_DATA with their Organized namesakes
 │
-└── Benchmark/                         # Stages 2-4: benchmark, production run, exports
-    ├── README.md                      # v9 benchmark: vast.ai setup and run guide
-    ├── benchmark.py                   # v9 VLM benchmark (runs on the rented H200)
-    ├── ground_truth.csv               # Human-verified remarks for the 150 test scans
+├── Benchmark/                         # Stage 2: VLM benchmark (v9)
+│   ├── README.md                      # vast.ai setup and run guide
+│   ├── benchmark.py                   # v9 VLM benchmark (runs on the rented H200)
+│   └── ground_truth.csv               # Human-verified remarks for the 150 test scans
+│
+└── Production/                        # Stages 3-4: production run and exports
     ├── production.py                  # Production run client (runs locally, talks to vLLM on the H200)
     ├── tunnel.bat                     # SSH tunnel to the instance's vLLM server (fill in host and ports)
     ├── gt150_paths.txt                # The 150 test scans on the drive, for the production check
@@ -161,7 +163,7 @@ It writes `leftovers_all.csv` and `leftovers_differ_or_missing.csv`. Results on 
 | PNG_230317_B0012 | 252 | 619 |
 | **Total (all have a namesake)** | **275** | **3,520** |
 
-The 619 that differ in `PNG_230317_B0012` are corrupt RAW copies: they have the same byte count as their Organized namesake but are not valid images. The other **2,901** are real alternative scans of forms that are in Organized, encoded or sized differently. `Benchmark/extras_paths.txt` lists them: the `RAW_DATA` path of every `leftovers_differ_or_missing.csv` row outside `PNG_230317_B0012`, sorted. They were processed as a separate production run (Stage 3).
+The 619 that differ in `PNG_230317_B0012` are corrupt RAW copies: they have the same byte count as their Organized namesake but are not valid images. The other **2,901** are real alternative scans of forms that are in Organized, encoded or sized differently. `Production/extras_paths.txt` lists them: the `RAW_DATA` path of every `leftovers_differ_or_missing.csv` row outside `PNG_230317_B0012`, sorted. They were processed as a separate production run (Stage 3).
 
 ---
 
@@ -205,21 +207,23 @@ Each model runs at pixel budgets ("rungs") of 2, 4, 8 and 16 MiP (1 MiP = 1,048,
 
 ## Stage 3: Production Run
 
-`Benchmark/production.py` runs on the local Windows machine. It reads each scan from the external drive, resizes and PNG-encodes it exactly as benchmark v9 does, and sends it to a vLLM OpenAI-compatible server on the rented H200 through an SSH tunnel (`Benchmark/tunnel.bat`). Nothing but vLLM runs on the H200, and no scan is stored there. The output JSONL is also the checkpoint: the script can be stopped at any time and restarted with the same arguments, and it retries timeouts and connection errors automatically. The module docstring has the full status table, the `vllm serve` command and the retry rules.
+`Production/production.py` runs on the local Windows machine. It reads each scan from the external drive, resizes and PNG-encodes it exactly as benchmark v9 does, and sends it to a vLLM OpenAI-compatible server on the rented H200 through an SSH tunnel (`Production/tunnel.bat`). Nothing but vLLM runs on the H200, and no scan is stored there. The output JSONL is also the checkpoint: the script can be stopped at any time and restarted with the same arguments, and it retries timeouts and connection errors automatically. The module docstring has the full status table, the `vllm serve` command and the retry rules. `production.py` and `compare_v9.py` import v9's image and prompt code from `Benchmark/benchmark.py`, so the two folders must stay side by side.
+
+The October 2026 runs were made before these files moved out of `Benchmark/` (28 Oct 2026), so their logs show `Benchmark/` paths.
 
 ```bash
 # On the H200: start vLLM with v9's engine settings (see production.py's docstring for the full command)
-# Locally: fill in Benchmark/tunnel.bat and leave it running, then
-python Benchmark/production.py --file-list Benchmark/gt150_paths.txt \
+# Locally: fill in Production/tunnel.bat and leave it running, then
+python Production/production.py --file-list Production/gt150_paths.txt \
     --inventory-2014 EC_Inventories/inventory_2014.csv --inventory-2022 EC_Inventories/inventory_2022.csv \
     --out runs/gt150.jsonl --backup-dir C:/ec_backup
-python Benchmark/compare_v9.py runs/gt150.jsonl results/qwen3.8-27b_4MiP.jsonl --csv runs/compare_v9.csv
+python Production/compare_v9.py runs/gt150.jsonl results/qwen3.8-27b_4MiP.jsonl --csv runs/compare_v9.csv
 
-python Benchmark/production.py --file-list Benchmark/extras_paths.txt \
+python Production/production.py --file-list Production/extras_paths.txt \
     --inventory-2014 EC_Inventories/inventory_2014.csv --inventory-2022 EC_Inventories/inventory_2022.csv \
     --out runs/extras.jsonl --backup-dir C:/ec_backup
 
-python Benchmark/production.py --root "E:\PROCESSED_DATA\Organized" \
+python Production/production.py --root "E:\PROCESSED_DATA\Organized" \
     --inventory-2014 EC_Inventories/inventory_2014.csv --inventory-2022 EC_Inventories/inventory_2022.csv \
     --out runs/main.jsonl --backup-dir C:/ec_backup
 ```
@@ -244,8 +248,8 @@ python Benchmark/production.py --root "E:\PROCESSED_DATA\Organized" \
 Both export scripts only read the JSONLs. They keep one row per `source_path` from its latest record, sorted by `source_path`, so failed files stay visible instead of going missing. Pass `main.jsonl` first and `extras.jsonl` second.
 
 ```bash
-python Benchmark/export_xlsx.py runs/main.jsonl runs/extras.jsonl --xlsx runs/all.xlsx
-python Benchmark/export_db.py runs/main.jsonl runs/extras.jsonl --out-dir runs
+python Production/export_xlsx.py runs/main.jsonl runs/extras.jsonl --xlsx runs/all.xlsx
+python Production/export_db.py runs/main.jsonl runs/extras.jsonl --out-dir runs
 ```
 
 **`export_xlsx.py`** writes the Excel deliverable: a Results sheet with 570,818 rows (567,917 main + 2,901 extras) and a Summary sheet. Text is cleaned for Excel: illegal characters are stripped, cells are capped at 32,767 characters, and text that starts with `=` is stored as text. The columns are the JSONL fields plus:

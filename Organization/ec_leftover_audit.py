@@ -9,7 +9,7 @@ ec_organizer_enhanced.py counts a pre-1940 file before it moves it, and skips th
 destination name already exists. So 571,712 pre-1940 files were counted and 567,917 reached Organized;
 the other 3,795 are still in RAW_DATA, each next to a namesake in Organized. On the drive (22 Oct 2026):
 275 are byte-identical, 3,520 differ, none lacks a namesake. The 619 that differ in PNG_230317_B0012
-are corrupt RAW copies; the other 2,901 are real alternative scans and became Benchmark/extras_paths.txt
+are corrupt RAW copies; the other 2,901 are real alternative scans and became Production/extras_paths.txt
 (the RAW_DATA path of every leftovers_differ_or_missing.csv row outside PNG_230317_B0012, sorted).
 
 Writes leftovers_all.csv and leftovers_differ_or_missing.csv to OUT_DIR and the report to stdout.

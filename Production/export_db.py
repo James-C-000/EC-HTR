@@ -17,7 +17,7 @@ over output with the porter tokenizer, so a word matches its plural too:
 Every file is written under a temporary name and renamed once all of them are complete.
 Needs pyarrow (pip install pyarrow).
 
-  python Benchmark/export_db.py runs/main.jsonl runs/extras.jsonl --out-dir runs
+  python Production/export_db.py runs/main.jsonl runs/extras.jsonl --out-dir runs
 """
 
 import argparse

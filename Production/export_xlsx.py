@@ -11,8 +11,8 @@ Columns added after the production fields:
   alternate_scan       True for rows from any JSONL after the first (pass main.jsonl first, then extras.jsonl)
 Needs openpyxl (pip install openpyxl).
 
-  python Benchmark/export_xlsx.py runs/main.jsonl                  # writes runs/main.xlsx
-  python Benchmark/export_xlsx.py runs/main.jsonl runs/extras.jsonl --xlsx runs/all.xlsx
+  python Production/export_xlsx.py runs/main.jsonl                  # writes runs/main.xlsx
+  python Production/export_xlsx.py runs/main.jsonl runs/extras.jsonl --xlsx runs/all.xlsx
 """
 
 import argparse

@@ -34,7 +34,7 @@ except ok and decode_error is processed again on the next start.
 is polled every 30 s, and sending resumes when it answers. 20 read errors in a row mean the scan
 drive is gone: the run stops, and a restart with the same arguments continues it.
 
-  python Benchmark/production.py --file-list Benchmark/gt150_paths.txt \
+  python Production/production.py --file-list Production/gt150_paths.txt \
       --inventory-2014 inventory_2014.csv --inventory-2022 inventory_2022.csv \
       --out runs/gt150.jsonl --backup-dir D:/ec_backup
 """
@@ -57,7 +57,8 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from benchmark import MIB, build_prompt, clean, load_resized, load_stations, says_none
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Benchmark"))   # v9's benchmark.py
+from benchmark import MIB, build_prompt, clean, load_resized, load_stations, says_none  # noqa: E402
 
 MODEL = "Qwen/Qwen3.8-27B"
 BUDGET_PX = 4 * MIB
