@@ -53,8 +53,9 @@ EC-HTR/
 │   ├── export_xlsx.py                 # Production JSONL -> Excel deliverable
 │   └── export_db.py                   # Production JSONL -> Parquet + SQLite datasets
 │
-└── Post-Processing/                   # Stage 5: cleaning the remarks
-    └── clean_remarks.py               # Conservative line-level cleaning -> ec_remarks_clean .parquet / .sqlite
+└── Post-Processing/                   # Stage 5: cleaning the remarks and the cleaned Excel export
+    ├── clean_remarks.py               # Removes junk lines only -> ec_remarks_clean .parquet / .sqlite
+    └── export_clean_xlsx.py           # ec_remarks_clean .sqlite + .parquet -> ec_remarks_clean.xlsx
 ```
 
 **Not in the repo:**
@@ -294,7 +295,7 @@ The full-text index uses the porter stemmer, so `aurora` also matches `auroras`.
 
 ## Stage 5: Post-Processing
 
-The raw output is noisy: two thirds of all output lines are in the 31,358 token-capped repetition loops, and much of the rest is routine weather (states like "Rain" or "Cloudy", wind directions, monthly statistics) that the project scope excludes. `Post-Processing/clean_remarks.py` cleans it line by line. It is **conservative and non-destructive**: `output` and every other input column stay exactly as produced, the cleaned text goes in new columns, and every removed line is listed with the rule that removed it. It needs `duckdb` and `pandas`.
+The raw output is noisy: two thirds of all output lines are in the 31,358 token-capped repetition loops, and much of the rest is routine weather (states like "Rain" or "Cloudy", wind directions, monthly statistics) that the project scope excludes. `Post-Processing/clean_remarks.py` cleans it line by line, and for now **only removes junk**: repeated lines, stray marks, empty entries such as "None", and the cut-off fragments that end repetition loops. Routine weather and statistics are kept, so nothing that might be in scope is lost. It is also **non-destructive**: `output` and every other input column stay exactly as produced, the cleaned text goes in new columns, and every removed line is listed with the rule that removed it. It needs `duckdb` and `pandas`.
 
 It reads `ec_remarks.parquet` and `ec_remarks.sqlite` (from the same `export_db.py` run) from `Production/`, opening both read-only, and writes its outputs to `Post-Processing/`. Use `--production-dir` and `--out-dir` for other folders.
 
@@ -333,29 +334,41 @@ SELECT line_no, text, removed_by FROM remark_lines
 WHERE source_path = ? AND removed_by IS NOT NULL ORDER BY line_no;
 ```
 
-A word search can find fewer forms in `remarks_clean_fts` than in `remarks_fts`: "aurora" matches 16,938 forms in the cleaned text and 18,343 in the raw output. The 1,405 difference is forms whose only aurora lines were zero-count table entries such as "Aurora 0".
+A word search finds the same forms in `remarks_clean_fts` as in `remarks_fts` unless the word only occurs in removed lines: "aurora" matches 18,343 forms in both.
 
 Lines are compared after lowercasing and stripping accents and punctuation. Repeats within a form are kept once. Then each distinct line is removed only if it matches one of these rules:
 
 | Rule | Removes | Example | Lines removed |
 |---|---|---|---|
-| `plain_weather` | Fewer than 8 words, all plain weather, time, direction or function words (some French included) | "Rain", "Fine warm", "Light rain at night" | 771,380 |
-| `reading` | At least one number with only statistics, compass or month words, or single letters alone | "Max = 97.0 on 18th", "NE 8" | 381,775 |
-| `zero_count` | A printed summary-table entry with a zero count | "Aurora 0", "Gales 0" | 5,922 |
-| `null_entry` | Only "No", "None", "Nil", "Nothing" | "None" | 5,186 |
-| `cut_off_repeat` | The cut-off last line of a capped output that begins a kept line in the same form | "Qu" after "Quel Cool" | 3,365 |
-| `symbols` | No letters or digits | ditto marks | 3,156 |
+| `cut_off_repeat` | The cut-off last line of a capped output that begins a kept line in the same form | "Qu" after "Quel Cool", "Sh" after "Showers" | 7,294 |
+| `null_entry` | "No", "None", "Nil", "Nothing" (or "Remarks"), with at most numbers and single letters beside it | "None", "No.", "0 None" | 5,245 |
+| `symbols` | No letters or digits | ditto marks, "?", "*" | 3,156 |
 
-Everything else is kept, including intensifiers (very, heavy, severe), event words (storm, thunder, frost, hail, gale), expressive words (gloomy, sultry), months and seasons, misspellings, plain-vocabulary narratives of 8+ words, and, for now, lines with hot, cold, dry, drift/drifting, blowing or fall (possible heat, cold, drought and blowing-snow events). No line with a phenology or phenomenon keyword (robin, geese, ice, thaw, aurora, smoke, frost, storm and so on) is removed by the vocabulary rules. The filter errs towards keeping: lines such as "Trace", "Sunday" or "Total" are kept because they carry no number, and can be filtered later.
+Every other line is kept, whether or not it is in scope: plain weather states ("Rain", "Fine warm"), statistics and readings ("Max = 97.0 on 18th", "min -38 on 8th", "Snowfall 11.00"), summary-table entries ("Aurora 0"), lone numbers and letters, and anything misspelled or unrecognised. The 1,290 forms with remarks but nothing kept contain only empty entries and stray marks.
 
 | | Before | After |
 |---|---|---|
-| Forms with remarks (main + extras) | 334,505 | 251,381 |
-| Forms with remarks (main) | 332,739 | 250,203 |
-| Output lines (non-empty) → distinct lines kept | 7,787,744 | 1,064,406 |
-| Characters | 74.1M | 22.8M |
+| Forms with remarks (main + extras) | 334,505 | 333,215 |
+| Forms with remarks (main) | 332,739 | 331,452 |
+| Output lines (non-empty) → distinct lines kept | 7,787,744 | 2,219,495 |
+| Characters | 74.1M | 37.8M |
 
-Kept lines are still mostly routine; the cleaning only removes lines that are clearly out of scope. To make it stricter later, edit the word lists in the script and re-run it; the `lines` column (`remark_lines` in SQLite) shows exactly which lines any change affects.
+Most kept lines are routine weather that the project scope excludes. An earlier version (git `bc59876` and before) also removed them with three vocabulary rules: `plain_weather` (short lines of plain weather words), `reading` (numbers with only statistics, compass or month words) and `zero_count` (summary-table entries with a 0 count). Together those rules removed 1,159,077 lines, leaving 251,381 forms with remarks. They were dropped because their word lists also caught possible events, such as extreme readings ("min -38 on 8th") and large snowfalls ("20 inches"). Any stricter filtering can be added later; the `lines` column (`remark_lines` in SQLite) shows exactly which lines a rule change affects.
+
+### Excel Export
+
+`Post-Processing/export_clean_xlsx.py` turns the two cleaned files into the Excel deliverable `ec_remarks_clean.xlsx`. It opens both read-only and reads from `Post-Processing/` and writes there by default (`--in-dir`, `--out-dir`). It needs `duckdb` and `openpyxl`.
+
+```bash
+pip install duckdb openpyxl
+python Post-Processing/export_clean_xlsx.py
+```
+
+- **Results** has one row per scan (570,818), sorted by `source_path`. It holds every column of the SQLite `remarks` table unchanged, with `has_remarks`, `alternate_scan` and `has_remarks_clean` shown as TRUE/FALSE (blank for the 16 failed files). Excel has no empty text, so a `remarks_clean` with nothing kept is a blank cell; `has_remarks_clean` (FALSE, or blank for a failed file) tells the two apart. One column is added:
+  - `removed_lines`: every line the cleaning removed, in order, one per line as `[rule] text`. It is the Excel form of the Parquet `lines` column; the kept lines are in `remarks_clean`.
+- **Summary** has the row and line counts, the lines removed by each rule, the size and SHA-256 of both inputs, the cleaning provenance (`clean_provenance`), the export time and the script's git commit.
+
+The rows come from the SQLite file and `removed_lines` from the Parquet file. The script checks that both have the same `source_path`, `output` and `remarks_clean` on every row, and writes nothing if they differ. Text is cleaned for Excel as in `export_xlsx.py`, and the Summary counts any cells this changed. The file is written under a temporary name and renamed once complete.
 
 ---
 

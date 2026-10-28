@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Conservative, non-destructive cleaning of the EC production-run remarks.
+Conservative, non-destructive cleaning of the EC production-run remarks: only junk lines are removed.
 
 Inputs (read-only), from --production-dir (default: Production/, beside this folder), as written by
 Production/export_db.py from the same JSONLs:
@@ -33,28 +33,20 @@ Cleaning columns:
 Nothing is deleted: `output` is left exactly as produced, and every removed line is listed with its rule.
 
 Lines are compared after normalisation (lowercase, accents stripped, punctuation -> space).
-Rules, applied to each distinct line of a form:
+Only lines that are plainly not content are removed: marks with no letters or digits, empty entries
+such as "None", and the cut-off fragment that ends a repetition loop. Every other line is kept,
+whether or not it is in scope. Rules, applied to each distinct line of a form:
   repeat   : a line that recurs in the same form is kept once (first occurrence's text)
              and its count is shown as " [×N]". Not counted as a removal of content.
-  symbols  : no letters or digits at all (stray marks, Vienna-congress weather symbols)
-  reading  : at least one number, plus only statistics/compass/month words or single letters
-             ("Max = 97.0 on 18th", "Mean 59", "NE 8", "Sept 14 a.m."); or single letters alone.
-             Lines with no number ("Trace", "March", "Sunday") are left to the other rules
-  zero_count: a printed summary-table entry with a zero count ("Aurora 0", "Gales 0")
-  null_entry: only "No", "None", "Nil", "Nothing"
+  symbols  : no letters or digits at all (stray marks, ditto marks, Vienna-congress weather symbols)
+  null_entry: "No", "None", "Nil", "Nothing" (or "Remarks"), with at most numbers and single letters
+             beside it ("No.", "None.", "No. 2")
   cut_off_repeat: in a token-capped output, the cut-off final line when it is the start of
              another kept line in the same form ("Qu" after "Quel Cool", "Storm" after "Stormy");
              its content is in that line. A line with no letters or digits never qualifies
-  plain_weather: every word is plain weather-state, time, direction or function vocabulary
-             ("Rain", "Cloudy", "Fine warm", "Light rain at night", "All day"), and the line
-             has fewer than 8 words (longer plain-vocabulary narratives are kept).
-             Lines are KEPT if they contain any other word, including intensifiers (very,
-             heavy, strong, high, severe...), event words (storm, thunder, lightning, frost,
-             hail, gale...), expressive words (beautiful, gloomy, sultry...), haze/smoke,
-             thaw/freeze, month or season names, or anything misspelled/unrecognised.
-             Conservative for now: hot, cold, dry, drift(ing/ed), blowing and fall are not plain
-             vocabulary, so lines like "Hot & dry", "Snow drifting" or "Cold" are kept (possible
-             heat, cold, drought and blowing-snow events). Stricter filtering can come later.
+Earlier versions (git bc59876 and before) also removed routine weather and statistics lines with
+the rules plain_weather, reading and zero_count; they were dropped to keep every line that might
+be in scope.
 
 Both files are written under temporary names and renamed once both are complete.
 
@@ -77,61 +69,9 @@ import pandas as pd
 def W(s):
     return frozenset(s.split())
 
-# --- plain vocabulary: a line made only of these (plus numbers/ordinals/single letters) is removed.
-# Left out on purpose, so lines with them are kept: hot, hotter, cold, colder, dry, drier, drift, drifted,
-# drifting, blowing (heat, cold, drought, blowing snow) and fall (also the season).
-PLAIN = W("""
-clear clearing cleared clears cloudy cloud clouds clouded clouding cldy cloudless overcast fine fair dull
-bright sunny sunshine sun shining partly mostly good
-rain rains rained raining rainy rainfall shower showers showery showering drizzle drizzling drizzly
-sprinkle sprinkles sprinkling snow snows snowing snowed snowy snowfall flurries flurry snowflurries flakes
-sleet sleety precipitation precip drops falling fell
-fog foggy fogs mist misty
-warm warmer cool cooler mild milder chilly damp wet
-wind winds windy breeze breezy breezes calm calms fresh gusty gust gusts blustery
-unsettled changeable variable
-light lght lgt lt slight slightly little moderate mod gentle some few occasional occasionally intermittent
-intermittently continuous steady quite rather fairly generally
-day days night nights morning mornings morn forenoon afternoon afternoons aft evening evenings eve noon
-midnight am pm early late later all during in at on of the and with to from till til until then after before
-by through thru throughout part times time hours hrs hour hr today tonight since again still but also becoming
-turning turned changing changed began commenced started ended stopped continued continuing about it is was
-were be been has had this that or so as for up down off out here weather clock oclock half whole
-do ditto dto
-n s e w ne nw se sw nne ene ese sse ssw wsw wnw nnw north south east west northerly southerly easterly westerly
-northeast northwest southeast southwest bc
-pluie pluies neige neiges beau belle temps nuageux nuages nuageuse couvert vent vents froid froide chaud chaude
-doux brume brouillard nuit jour journee matin soir apres midi la le les de du des et au aux dans tout toute
-pendant leger legere humide sec clair frais gris averse averses bruine faible
-""")
-
-# --- statistics/compass vocabulary for the `reading` rule (numbers required or single letters only)
-STAT = W("""
-max min mean maximum minimum temp temperature total totals av avg average highest lowest range monthly month
-precip precipitation rainfall snowfall
-inches inch ins in on at of to days day deg degrees f trace traces measured gauge reading readings
-am pm a m p bulb wet dry mmt
-jan january feb february mar march apr april may jun june jul july aug august sep sept september oct october
-nov november dec december
-monday tuesday wednesday thursday friday saturday sunday mon tue tues wed thu thur thurs fri sat tr
-n s e w ne nw se sw nne ene ese sse ssw wsw wnw nnw north south east west c calm calms
-""")
-
 # a line made only of these is an empty entry ("None", "Nil", "No")
 NULLS = W("no none nil nothing remarks remark")
 
-# plain-vocabulary lines with at least this many words are kept: they read as observer-written
-# weather narratives rather than recorded states
-LONG_PLAIN_WORDS = 8
-
-# labels that may precede/follow a zero in a summary table; one-word lines with a zero count are
-# treated as table entries whatever the word (HTR often garbles printed labels: "Salone 0")
-SUMMARY_LABELS = W("""
-clear cloudy fog fogs aurora auroras gale gales thunder thunderstorm thunderstorms hail halo halos solar lunar
-rain snow frost days calm calms storms storm lightning corona coronas parhelia rainbow rainbows mist dew
-""")
-
-NUM = re.compile(r"^\d+$")
 ORD = re.compile(r"^\d+(st|nd|rd|th|a|p|am|pm|h|hr|hrs|in)?$")
 
 
@@ -140,32 +80,16 @@ def rule_for(norm: str):
     toks = norm.split()
     if not toks:
         return "symbols"
+    # null_entry: "None", "Nil", "No", with at most numbers and single letters beside it
     alpha = [t for t in toks if not ORD.match(t)]
-    nums = [t for t in toks if NUM.match(t)]
-    # reading: numbers/ordinals with only statistics, compass, month words or single letters,
-    # or single letters alone
-    has_number = len(alpha) < len(toks)
-    if all(len(t) < 2 or t in STAT for t in alpha) and (has_number or all(len(t) < 2 for t in alpha)):
-        return "reading"
-    # zero_count: printed summary-table entry with a 0 count
-    if nums and all(n == "0" for n in nums) and len(alpha) >= 1:
-        words = [t for t in alpha if len(t) >= 2]
-        if len(words) == 1 or (len(words) == 2 and any(t in SUMMARY_LABELS for t in words)):
-            return "zero_count"
-    # null_entry: "None", "Nil", "No"
-    if all(t in NULLS or len(t) < 2 for t in alpha):
+    if any(t in NULLS for t in alpha) and all(t in NULLS or len(t) < 2 for t in alpha):
         return "null_entry"
-    # plain_weather: every token is plain vocabulary, a number/ordinal, or a single letter
-    if all(t in PLAIN or ORD.match(t) or len(t) < 2 for t in toks):
-        if len([t for t in alpha if len(t) >= 2]) >= LONG_PLAIN_WORDS:
-            return None
-        return "plain_weather"
     return None
 
 
 # cut_off_repeat is assigned in SQL: the last line of a token-capped output, cut mid-line,
 # when it is the start of another line in the same form (the loop restarting)
-RULES = ["symbols", "reading", "zero_count", "null_entry", "plain_weather", "cut_off_repeat"]
+RULES = ["symbols", "null_entry", "cut_off_repeat"]
 
 
 def sql_path(p) -> str:
