@@ -32,6 +32,7 @@ EC-HTR/
 ├── Organization/                      # Stage 1: File organization tools
 │   ├── ec_organizer_enhanced.py       # Sorts scans by province/territory and year
 │   ├── ec_verify_organization.py      # Verifies correct file placement
+│   ├── ec_check_integrity.py          # Pre-H200 check: counts, names, full decode of every scan
 │   ├── EC-Inventory-2014.csv          # Station inventory (18,707 stations)
 │   ├── EC-Inventory-2022.csv          # Station inventory (8,781 stations)
 │   ├── organization_stats.csv         # Organization results
@@ -103,6 +104,22 @@ python Organization/ec_verify_organization.py \
     --csv-2014 Organization/EC-Inventory-2014.csv \
     --csv-2022 Organization/EC-Inventory-2022.csv
 ```
+
+### Integrity Check (before the H200 run)
+
+`ec_check_integrity.py` is a read-only check of `PROCESSED_DATA` on the external drive. It:
+
+- Reconciles the file count of each folder with `organization_stats.json`. The organizer counted 7,750 same-name files that it then skipped. Those files are still in `RAW_DATA`, so each one is matched to its twin and byte-compared with it.
+- Checks every file name and era.
+- Reads, SHA-256 hashes and fully decodes every Organized scan with Pillow, the same way the inference pipeline opens it.
+
+```bash
+pip install pillow
+python Organization/ec_check_integrity.py "E:\PROCESSED_DATA" --limit 100 --out-dir integrity_smoke   # a few minutes
+python Organization/ec_check_integrity.py "E:\PROCESSED_DATA" --out-dir integrity_full              # about 4-6 hours
+```
+
+It writes `manifest.csv` (one row per scan with its hash and status), `issues.csv`, `raw_leftovers.csv` and `summary.json` to `--out-dir`. It exits with code 1 if any check fails. If a run is interrupted (Ctrl+C or a disconnected drive), it continues where it stopped with `--resume`.
 
 ---
 
