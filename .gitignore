@@ -1,0 +1,23 @@
+# Results, logs and data stay out of the repo: only the scripts and the inputs we can share are tracked.
+runs/
+results/
+*.jsonl
+*.log
+*.xlsx
+*.parquet
+*.sqlite
+*.sqlite-journal
+*.provenance.json
+leftover_audit/
+province_audit/
+integrity_*/
+organization_stats.*
+verification_results.json
+
+# Scans and the ECCC station inventories are not redistributed
+test_images/
+EC_Inventories/
+inventory_20*.csv
+EC-Inventory-*.csv
+
+__pycache__/
