@@ -54,7 +54,7 @@ EC-HTR/
 │   └── export_db.py                   # Production JSONL -> Parquet + SQLite datasets
 │
 └── Post-Processing/                   # Stage 5: cleaning the remarks
-    └── clean_remarks.py               # Conservative line-level cleaning -> ec_remarks_clean / ec_remark_lines
+    └── clean_remarks.py               # Conservative line-level cleaning -> ec_remarks_clean .parquet / .sqlite
 ```
 
 **Not in the repo:**
@@ -296,15 +296,44 @@ The full-text index uses the porter stemmer, so `aurora` also matches `auroras`.
 
 The raw output is noisy: two thirds of all output lines are in the 31,358 token-capped repetition loops, and much of the rest is routine weather (states like "Rain" or "Cloudy", wind directions, monthly statistics) that the project scope excludes. `Post-Processing/clean_remarks.py` cleans it line by line. It is **conservative and non-destructive**: `output` and every other input column stay exactly as produced, the cleaned text goes in new columns, and every removed line is listed with the rule that removed it. It needs `duckdb` and `pandas`.
 
+It reads `ec_remarks.parquet` and `ec_remarks.sqlite` (from the same `export_db.py` run) from `Production/`, opening both read-only, and writes its outputs to `Post-Processing/`. Use `--production-dir` and `--out-dir` for other folders.
+
 ```bash
 pip install duckdb pandas
-python Post-Processing/clean_remarks.py runs/ec_remarks.parquet runs
+python Post-Processing/clean_remarks.py                                  # Production/ -> Post-Processing/
+python Post-Processing/clean_remarks.py --production-dir runs --out-dir runs
 ```
 
-It writes two files, under temporary names that are renamed once both are complete:
+Both outputs are new files with the cleaning columns added; the inputs are never modified. They are written under temporary names and renamed once both are complete.
 
-- `ec_remarks_clean.parquet`: the rows of `ec_remarks.parquet`, plus `remarks_clean` (the kept lines in their original order, one per distinct line), `has_remarks_clean`, `n_lines_raw`, `n_lines_clean` and one `n_removed_<rule>` count per rule. In forms that finished normally, a line that occurred N > 1 times ends with ` [×N]`. `remarks_clean` and `has_remarks_clean` are null for the 16 failed files, so a failed file never reads as having no remarks.
-- `ec_remark_lines.parquet`: one row per distinct line per form (2,235,190 rows), kept or removed, with `removed_by` (null = kept).
+- `ec_remarks_clean.parquet`: every row and column of `ec_remarks.parquet`, plus the cleaning columns.
+- `ec_remarks_clean.sqlite`: a copy of `ec_remarks.sqlite` (`remarks`, `attempts`, `provenance`, `remarks_fts`, all unchanged) with the cleaning columns added to `remarks`, plus:
+  - `remark_lines`: the `lines` column as a table, one row per line (2,235,190 rows), joined to `remarks` on `source_path`
+  - `remarks_clean_fts`: a full-text index over `remarks_clean`, next to the existing `remarks_fts` over `output`
+  - `clean_provenance`: each input's path, size and SHA-256, the cleaning time and the git commit of the script
+
+| Cleaning column | Meaning |
+|---|---|
+| `remarks_clean` | The kept lines in their original order, one per distinct line. In forms that finished normally, a line that occurred N > 1 times ends with ` [×N]`. Empty when nothing was kept |
+| `has_remarks_clean` | True if any line was kept |
+| `n_lines_raw`, `n_lines_clean` | Non-empty lines in `output` (0 for `NO_REMARKS` rows) and lines kept |
+| `n_removed_<rule>` | Distinct lines removed by each rule |
+| `lines` | Every distinct line of the form, kept or removed, in order: `line_no`, `text`, `times_in_form`, `removed_by` (null = kept). Empty for `NO_REMARKS` rows. In SQLite, the `remark_lines` table |
+
+`remarks_clean`, `has_remarks_clean` and `lines` are null for the 16 failed files, so a failed file never reads as having no remarks.
+
+```sql
+-- Forms whose cleaned remarks mention aurora, with the original output alongside
+SELECT r.source_path, r.year, r.month, r.remarks_clean, r.output
+FROM remarks_clean_fts f JOIN remarks r USING (source_path)
+WHERE remarks_clean_fts MATCH 'aurora';
+
+-- What the cleaning removed from one form, and why
+SELECT line_no, text, removed_by FROM remark_lines
+WHERE source_path = ? AND removed_by IS NOT NULL ORDER BY line_no;
+```
+
+A word search can find fewer forms in `remarks_clean_fts` than in `remarks_fts`: "aurora" matches 16,938 forms in the cleaned text and 18,343 in the raw output. The 1,405 difference is forms whose only aurora lines were zero-count table entries such as "Aurora 0".
 
 Lines are compared after lowercasing and stripping accents and punctuation. Repeats within a form are kept once. Then each distinct line is removed only if it matches one of these rules:
 
@@ -326,7 +355,7 @@ Everything else is kept, including intensifiers (very, heavy, severe), event wor
 | Output lines (non-empty) → distinct lines kept | 7,787,744 | 1,064,406 |
 | Characters | 74.1M | 22.8M |
 
-Kept lines are still mostly routine; the cleaning only removes lines that are clearly out of scope. To make it stricter later, edit the word lists in the script and re-run it; `ec_remark_lines.parquet` shows exactly which lines any change affects.
+Kept lines are still mostly routine; the cleaning only removes lines that are clearly out of scope. To make it stricter later, edit the word lists in the script and re-run it; the `lines` column (`remark_lines` in SQLite) shows exactly which lines any change affects.
 
 ---
 
